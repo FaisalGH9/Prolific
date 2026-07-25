@@ -1,0 +1,22 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local browser session and authentication data
+.browser-profile/
+
+# Runtime state
+state/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Local Codex metadata
+.agents/
+
+# Logs and editor/OS files
+*.log
+.DS_Store
+Thumbs.db
