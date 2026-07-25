@@ -25,5 +25,25 @@ class RewardFormattingTests(unittest.TestCase):
         self.assertIn("Reward: \N{POUND SIGN}3.98", message)
 
 
+class BrowserGuardTests(unittest.TestCase):
+    def test_target_study_expires_without_disabling_manual_only_rule(self) -> None:
+        script = monitor.build_persistent_take_part_script()
+
+        self.assertIn('const targetStudyMaxAgeMs = 60000;', script)
+        self.assertIn('PROLIFIC_TARGET_STUDY_EXPIRED', script)
+        self.assertIn('prolificAutoTargetStudyDetectedAt', script)
+        self.assertIn(
+            'if (!targetStudyTitle && !targetStudyId) return true;',
+            script,
+        )
+        self.assertIn('const manualOnlyEnabled = true;', script)
+        self.assertIn('if (isManualOnlyStudy()) return false;', script)
+
+    def test_target_study_timeout_is_configurable(self) -> None:
+        script = monitor.build_persistent_take_part_script(15)
+
+        self.assertIn('const targetStudyMaxAgeMs = 15000;', script)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,9 @@ This version includes:
   a fallback.
 - Interactive-card targeting and retries until the real **Take part** button
   appears.
+- A stale study target expires after 60 seconds when its card is no longer
+  available. Once cleared, the browser guard stops producing repeated
+  **Target study card not found** messages and continues watching normally.
 - Automatic retries when Prolific reports that a study is in high demand.
 - Detection and Telegram reporting of successful reservations and full studies.
 - Cleanup of duplicate Prolific browser tabs.
@@ -30,7 +33,7 @@ This version includes:
 - `prolific_monitor.py` — monitor, browser watcher, auto-click guard, and
   Telegram integration.
 - `prolific-monitor.json` — polling and browser-request configuration.
-- `test_prolific_monitor.py` — reward-formatting tests.
+- `test_prolific_monitor.py` — reward-formatting and browser-guard tests.
 - `.env.example` — required environment-variable names without secret values.
 
 ## Configuration

@@ -300,6 +300,7 @@ def load_config(path: Path) -> dict[str, Any]:
     if isinstance(browser, dict):
         browser.setdefault("auto_take_part", True)
         browser.setdefault("take_part_timeout_seconds", 15)
+        browser.setdefault("target_study_timeout_seconds", 60)
     return config
 
 
@@ -701,6 +702,7 @@ def watch_browser_tokens(
     manual_only_marker = "PROLIFIC_MANUAL_ONLY_SKIPPED"
     target_open_marker = "PROLIFIC_TARGET_STUDY_OPEN_ATTEMPT"
     target_missing_marker = "PROLIFIC_TARGET_STUDY_NOT_FOUND"
+    target_expired_marker = "PROLIFIC_TARGET_STUDY_EXPIRED"
 
     duplicates_closed = close_duplicate_prolific_targets(port, websocket_url)
     if duplicates_closed:
@@ -745,6 +747,9 @@ def watch_browser_tokens(
                                 "sessionStorage.setItem("
                                 "'prolificAutoTargetStudyId', "
                                 f"{json.dumps(target_id)}"
+                                ");sessionStorage.setItem("
+                                "'prolificAutoTargetStudyDetectedAt', "
+                                "String(Date.now())"
                                 ")"
                             ),
                         },
@@ -792,6 +797,8 @@ def watch_browser_tokens(
                     log("Target study card clicked; waiting for the Take part button.")
                 if target_missing_marker in values:
                     log("Target study card not found yet; continuing to retry.")
+                if target_expired_marker in values:
+                    log("Target study expired after 60 seconds; it is no longer available.")
 
             if "id" in message:
                 command_id = int(message["id"])
@@ -993,20 +1000,27 @@ def install_take_part_guard(
         browser_config = config.get("browser")
         if not isinstance(browser_config, dict) or not browser_config.get("auto_take_part", True):
             return
+        target_study_timeout_seconds = int(
+            browser_config.get("target_study_timeout_seconds", 60)
+        )
         devtools.command(
             "Runtime.evaluate",
             {
-                "expression": build_persistent_take_part_script(),
+                "expression": build_persistent_take_part_script(
+                    target_study_timeout_seconds
+                ),
                 "userGesture": True,
             },
         )
         if announce:
             log("Browser auto-click guard is active.")
-    except MonitorError as exc:
+    except (MonitorError, TypeError, ValueError) as exc:
         log(f"Could not install browser auto-click guard: {exc}")
 
 
-def build_persistent_take_part_script() -> str:
+def build_persistent_take_part_script(
+    target_study_timeout_seconds: int = 60,
+) -> str:
     script = """
 (() => {
   if (window.__prolificTakePartGuardActive) return "already-active";
@@ -1019,7 +1033,9 @@ def build_persistent_take_part_script() -> str:
   const manualOnlyMarker = "PROLIFIC_MANUAL_ONLY_SKIPPED";
   const targetOpenMarker = "PROLIFIC_TARGET_STUDY_OPEN_ATTEMPT";
   const targetMissingMarker = "PROLIFIC_TARGET_STUDY_NOT_FOUND";
+  const targetExpiredMarker = "PROLIFIC_TARGET_STUDY_EXPIRED";
   const targetText = "take part in this study";
+  const targetStudyMaxAgeMs = __TARGET_STUDY_MAX_AGE_MS__;
   const manualOnlyEnabled = __MANUAL_ONLY_ENABLED__;
   const manualOnlyTitle = "saudi sexism detection";
   const manualOnlyResearcher = "qmul.ac.uk";
@@ -1028,6 +1044,7 @@ def build_persistent_take_part_script() -> str:
   const pendingKey = "prolificAutoTakePartPendingAt";
   const targetStudyKey = "prolificAutoTargetStudyTitle";
   const targetStudyIdKey = "prolificAutoTargetStudyId";
+  const targetStudyDetectedAtKey = "prolificAutoTargetStudyDetectedAt";
   const readPendingAt = () => {
     try {
       return Number(sessionStorage.getItem(pendingKey) || 0);
@@ -1051,15 +1068,45 @@ def build_persistent_take_part_script() -> str:
   let targetStudyTitleRaw = "";
   let targetStudyTitle = "";
   let targetStudyId = "";
+  let targetStudyDetectedAt = 0;
   try {
     targetStudyTitleRaw = sessionStorage.getItem(targetStudyKey) || "";
     targetStudyTitle = normalize(targetStudyTitleRaw);
     targetStudyId = normalize(sessionStorage.getItem(targetStudyIdKey) || "");
+    targetStudyDetectedAt = Number(
+      sessionStorage.getItem(targetStudyDetectedAtKey) || 0
+    );
   } catch (_) {}
   let targetStudySelected = !targetStudyTitle && !targetStudyId;
+  let targetStudyExpired = false;
   let targetReadyAt = 0;
   let targetSelectionAttemptedAt = 0;
   let lastTargetMissingNoticeAt = 0;
+  const clearTargetStudy = () => {
+    try {
+      [targetStudyKey, targetStudyIdKey, targetStudyDetectedAtKey]
+        .forEach((key) => sessionStorage.removeItem(key));
+    } catch (_) {}
+    targetStudyTitleRaw = "";
+    targetStudyTitle = "";
+    targetStudyId = "";
+    targetStudyDetectedAt = 0;
+  };
+  const expireTargetStudyIfNeeded = () => {
+    if (targetStudyExpired) return true;
+    if (!targetStudyTitle && !targetStudyId) return false;
+    if (
+      targetStudyDetectedAt &&
+      Date.now() - targetStudyDetectedAt < targetStudyMaxAgeMs
+    ) return false;
+    const expiredStudyId = targetStudyId;
+    const expiredStudyTitle = targetStudyTitleRaw;
+    clearTargetStudy();
+    targetStudyExpired = true;
+    targetStudySelected = false;
+    console.log(targetExpiredMarker, expiredStudyId, expiredStudyTitle);
+    return true;
+  };
   const reservedTexts = [
     "your place has been reserved",
     "your place is reserved",
@@ -1172,6 +1219,10 @@ def build_persistent_take_part_script() -> str:
     return values;
   };
   const selectTargetStudy = () => {
+    if (expireTargetStudyIfNeeded()) return false;
+    // No stored target means there is no study card to search for. Continue
+    // normally so the guard can still click a visible Take part button.
+    if (!targetStudyTitle && !targetStudyId) return true;
     if (visibleTakePartControl()) {
       targetStudySelected = true;
       return Date.now() >= targetReadyAt;
@@ -1241,9 +1292,8 @@ def build_persistent_take_part_script() -> str:
     try {
       alreadyReported = sessionStorage.getItem(manualOnlyReportedKey) === location.href;
       sessionStorage.setItem(manualOnlyReportedKey, location.href);
-      sessionStorage.removeItem(targetStudyKey);
-      sessionStorage.removeItem(targetStudyIdKey);
     } catch (_) {}
+    clearTargetStudy();
     if (!alreadyReported) {
       console.log(manualOnlyMarker, location.href, selectedTitleDisplay);
     }
@@ -1321,10 +1371,7 @@ def build_persistent_take_part_script() -> str:
         retryMode = false;
         nextRetryAt = Date.now() + 500;
         control.click();
-        try {
-          sessionStorage.removeItem(targetStudyKey);
-          sessionStorage.removeItem(targetStudyIdKey);
-        } catch (_) {}
+        clearTargetStudy();
         console.log(marker);
         return true;
       }
@@ -1345,9 +1392,14 @@ def build_persistent_take_part_script() -> str:
   return "watching";
 })()
 """.strip()
-    return script.replace(
-        "__MANUAL_ONLY_ENABLED__",
-        "true" if MANUAL_ONLY_STUDY_RULE_ENABLED else "false",
+    return (
+        script.replace(
+            "__MANUAL_ONLY_ENABLED__",
+            "true" if MANUAL_ONLY_STUDY_RULE_ENABLED else "false",
+        ).replace(
+            "__TARGET_STUDY_MAX_AGE_MS__",
+            str(max(5, target_study_timeout_seconds) * 1000),
+        )
     )
 
 
