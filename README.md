@@ -18,7 +18,7 @@ This version includes:
   a fallback.
 - Interactive-card targeting and retries until the real **Take part** button
   appears.
-- A stale study target expires after 60 seconds when its card is no longer
+- A stale study target expires after 20 seconds when its card is no longer
   available. Once cleared, the browser guard stops producing repeated
   **Target study card not found** messages and continues watching normally.
 - Automatic retries when Prolific reports that a study is in high demand.

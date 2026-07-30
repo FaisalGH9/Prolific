@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import zlib
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
@@ -300,7 +301,7 @@ def load_config(path: Path) -> dict[str, Any]:
     if isinstance(browser, dict):
         browser.setdefault("auto_take_part", True)
         browser.setdefault("take_part_timeout_seconds", 15)
-        browser.setdefault("target_study_timeout_seconds", 60)
+        browser.setdefault("target_study_timeout_seconds", 20)
     return config
 
 
@@ -695,6 +696,19 @@ def watch_browser_tokens(
     request_urls: dict[str, str] = {}
     pending_bodies: dict[int, str] = {}
     pending_clicks: dict[int, str] = {}
+    pending_studies: deque[dict[str, Any]] = deque()
+    active_target = False
+    active_target_deadline: float | None = None
+    target_timeout_seconds = 20
+    if config_path is not None:
+        try:
+            browser_config = load_config(config_path).get("browser")
+            if isinstance(browser_config, dict):
+                target_timeout_seconds = int(
+                    browser_config.get("target_study_timeout_seconds", 20)
+                )
+        except (MonitorError, TypeError, ValueError) as exc:
+            log(f"Could not read browser target timeout; using 20 seconds: {exc}")
     click_guard_marker = "PROLIFIC_AUTO_TAKE_PART_CLICKED"
     reserved_marker = "PROLIFIC_SEAT_RESERVED"
     full_marker = "PROLIFIC_STUDY_FULL"
@@ -717,18 +731,46 @@ def watch_browser_tokens(
         log("Watching browser network requests for fresh Prolific tokens.")
 
         while stop_event is None or not stop_event.is_set():
-            if study_queue is not None and not study_queue.empty():
+            if (
+                active_target
+                and active_target_deadline is not None
+                and time.monotonic() >= active_target_deadline
+            ):
+                log(
+                    f"Browser target timed out after {target_timeout_seconds} seconds; "
+                    "advancing to the next queued study."
+                )
+                active_target = False
+                active_target_deadline = None
+                devtools.command(
+                    "Runtime.evaluate",
+                    {
+                        "expression": (
+                            "sessionStorage.removeItem('prolificAutoTargetStudyTitle');"
+                            "sessionStorage.removeItem('prolificAutoTargetStudyId');"
+                            "sessionStorage.removeItem('prolificAutoTargetStudyDetectedAt')"
+                        ),
+                    },
+                )
+
+            if study_queue is not None:
+                while True:
+                    try:
+                        pending_studies.extend(study_queue.get_nowait())
+                    except queue.Empty:
+                        break
+
+            if not active_target and pending_studies:
                 if prolific_target_changed(port, websocket_url):
                     raise MonitorError("Watcher is no longer on Prolific; reconnecting the auto-click guard.")
-                queued_studies = study_queue.get_nowait()
-                target_study = queued_studies[0] if queued_studies else {}
+                target_study = pending_studies.popleft()
                 target_title = first_value(
                     target_study,
                     ("title", "name", "internal_name"),
                     "",
                 )
                 target_id = study_id(target_study) or ""
-                if target_title:
+                if target_title or target_id:
                     devtools.command(
                         "Runtime.evaluate",
                         {
@@ -736,15 +778,7 @@ def watch_browser_tokens(
                                 "sessionStorage.setItem("
                                 "'prolificAutoTargetStudyTitle', "
                                 f"{json.dumps(target_title)}"
-                                ")"
-                            ),
-                        },
-                    )
-                    devtools.command(
-                        "Runtime.evaluate",
-                        {
-                            "expression": (
-                                "sessionStorage.setItem("
+                                ");sessionStorage.setItem("
                                 "'prolificAutoTargetStudyId', "
                                 f"{json.dumps(target_id)}"
                                 ");sessionStorage.setItem("
@@ -754,9 +788,16 @@ def watch_browser_tokens(
                             ),
                         },
                     )
-                    log(f"Poll detected study; opening it in browser: {target_title}")
-                devtools.command("Page.bringToFront")
-                devtools.command("Page.navigate", {"url": "https://app.prolific.com/studies"})
+                    active_target = True
+                    active_target_deadline = (
+                        time.monotonic() + target_timeout_seconds
+                    )
+                    target_label = target_title or target_id
+                    log(f"Queued study detected; opening it in browser: {target_label}")
+                    devtools.command("Page.bringToFront")
+                    devtools.command("Page.navigate", {"url": "https://app.prolific.com/studies"})
+                else:
+                    log("Skipped queued study without a title or ID.")
 
             try:
                 message = devtools.recv_json()
@@ -785,20 +826,33 @@ def watch_browser_tokens(
                 ]
                 if click_guard_marker in values:
                     log("Take part button clicked; waiting for Prolific to confirm the reservation.")
+                    active_target_deadline = None
                 if reserved_marker in values:
                     handle_reservation_result(config_path, reserved=True)
+                    active_target = False
+                    active_target_deadline = None
+                    pending_studies.clear()
                 if full_marker in values:
                     handle_reservation_result(config_path, reserved=False)
+                    active_target = False
+                    active_target_deadline = None
                 if high_demand_marker in values:
                     log("High demand detected; automatically retrying the Take part button.")
                 if manual_only_marker in values:
                     handle_manual_only_study(config_path, values)
+                    active_target = False
+                    active_target_deadline = None
                 if target_open_marker in values:
                     log("Target study card clicked; waiting for the Take part button.")
                 if target_missing_marker in values:
                     log("Target study card not found yet; continuing to retry.")
                 if target_expired_marker in values:
-                    log("Target study expired after 60 seconds; it is no longer available.")
+                    log(
+                        f"Target study expired after {target_timeout_seconds} seconds; "
+                        "it is no longer available."
+                    )
+                    active_target = False
+                    active_target_deadline = None
 
             if "id" in message:
                 command_id = int(message["id"])
@@ -810,6 +864,7 @@ def watch_browser_tokens(
                             config_path,
                             source_url,
                             devtools=devtools,
+                            study_queue=study_queue,
                         )
                     )
                 clicked_title = pending_clicks.pop(command_id, "")
@@ -846,8 +901,19 @@ def watch_browser_tokens(
                     save_bearer_token(token, env_path)
 
 
-def handle_browser_studies_body(result: dict[str, Any], config_path: Path | None, source_url: str) -> None:
-    handle_browser_studies_body_with_devtools(result, config_path, source_url, devtools=None)
+def handle_browser_studies_body(
+    result: dict[str, Any],
+    config_path: Path | None,
+    source_url: str,
+    study_queue: queue.Queue[list[dict[str, Any]]] | None = None,
+) -> None:
+    handle_browser_studies_body_with_devtools(
+        result,
+        config_path,
+        source_url,
+        devtools=None,
+        study_queue=study_queue,
+    )
 
 
 def handle_browser_studies_body_with_devtools(
@@ -855,6 +921,7 @@ def handle_browser_studies_body_with_devtools(
     config_path: Path | None,
     source_url: str,
     devtools: DevToolsWebSocket | None,
+    study_queue: queue.Queue[list[dict[str, Any]]] | None = None,
 ) -> dict[int, str]:
     if config_path is None:
         return {}
@@ -871,7 +938,19 @@ def handle_browser_studies_body_with_devtools(
         config = load_config(config_path)
         state_path = Path(str(config.get("state_file", DEFAULT_STATE)))
         studies = extract_studies(payload, config.get("studies_path"))
-        process_studies(studies, config, state_path, notify=True, source="browser")
+        new_studies = process_studies(
+            studies,
+            config,
+            state_path,
+            notify=True,
+            source="browser",
+        )
+        if study_queue is not None and new_studies:
+            study_queue.put(new_studies)
+            log(
+                f"Queued {len(new_studies)} browser-detected study/studies "
+                "for automatic opening."
+            )
         # The persistent page guard owns clicking and reservation-result tracking.
         return {}
     except MonitorError as exc:
@@ -1019,7 +1098,7 @@ def install_take_part_guard(
 
 
 def build_persistent_take_part_script(
-    target_study_timeout_seconds: int = 60,
+    target_study_timeout_seconds: int = 20,
 ) -> str:
     script = """
 (() => {
@@ -1218,19 +1297,57 @@ def build_persistent_take_part_script(
     }
     return values;
   };
+  const activeDetailContext = () => {
+    const takePartControl = visibleTakePartControl();
+    if (!takePartControl) return {headingTexts: [], text: ""};
+    let current = takePartControl;
+    for (let depth = 0; current && depth < 10; depth += 1, current = current.parentElement) {
+      const headingTexts = Array.from(current.querySelectorAll("h1"))
+        .filter((element) => {
+          const rect = element.getBoundingClientRect();
+          return rect.width && rect.height;
+        })
+        .map((element) => (element.innerText || element.textContent || "").trim())
+        .filter(Boolean);
+      if (headingTexts.length) {
+        return {
+          headingTexts,
+          text: normalize(current.innerText || current.textContent || "")
+        };
+      }
+    }
+    return {headingTexts: [], text: ""};
+  };
+  const activeStudyMatchesTarget = () => {
+    if (!targetStudyTitle && !targetStudyId) return false;
+    const takePartControl = visibleTakePartControl();
+    if (!takePartControl) return false;
+    if (
+      targetStudyId &&
+      (
+        normalize(location.href).includes(targetStudyId) ||
+        identityValues(takePartControl).some((value) => value.includes(targetStudyId))
+      )
+    ) return true;
+    const detail = activeDetailContext();
+    return Boolean(
+      targetStudyTitle &&
+      detail.headingTexts.some((heading) => titleSimilarity(heading) >= 0.75)
+    );
+  };
   const selectTargetStudy = () => {
     if (expireTargetStudyIfNeeded()) return false;
     // No stored target means there is no study card to search for. Continue
     // normally so the guard can still click a visible Take part button.
     if (!targetStudyTitle && !targetStudyId) return true;
-    if (visibleTakePartControl()) {
+    if (activeStudyMatchesTarget()) {
       targetStudySelected = true;
       return Date.now() >= targetReadyAt;
     }
     if (targetStudySelected) {
       if (Date.now() < targetReadyAt) return false;
       if (targetSelectionAttemptedAt && Date.now() - targetSelectionAttemptedAt < 2000) {
-        return true;
+        return false;
       }
       targetStudySelected = false;
     }
@@ -1275,26 +1392,23 @@ def build_persistent_take_part_script(
   };
   const isManualOnlyStudy = () => {
     if (!manualOnlyEnabled || !document.body) return false;
-    const headingTexts = Array.from(document.querySelectorAll("h1, h2"))
-      .map((element) => (element.innerText || element.textContent || "").trim())
-      .filter(Boolean);
-    const headings = normalize(headingTexts.join(" "));
-    const selectedTitle = targetStudyTitle || headings;
-    const selectedTitleDisplay = targetStudyTitleRaw || headingTexts.join(" ");
-    const pageText = normalize(document.body.innerText || document.body.textContent || "");
+    const detail = activeDetailContext();
+    const selectedTitle = targetStudyTitle || normalize(detail.headingTexts.join(" "));
+    const selectedTitleDisplay = targetStudyTitleRaw || detail.headingTexts.join(" ");
     if (
       !selectedTitle.includes(manualOnlyTitle) ||
-      !pageText.includes(manualOnlyResearcher)
+      !detail.text.includes(manualOnlyResearcher)
     ) {
       return false;
     }
+    const hadQueuedTarget = Boolean(targetStudyTitle || targetStudyId);
     let alreadyReported = false;
     try {
       alreadyReported = sessionStorage.getItem(manualOnlyReportedKey) === location.href;
       sessionStorage.setItem(manualOnlyReportedKey, location.href);
     } catch (_) {}
     clearTargetStudy();
-    if (!alreadyReported) {
+    if (hadQueuedTarget || !alreadyReported) {
       console.log(manualOnlyMarker, location.href, selectedTitleDisplay);
     }
     return true;
@@ -1681,6 +1795,10 @@ def check_once(
     new_studies = process_studies(studies, config, state_path, notify=notify, source="poll")
     if study_queue is not None and new_studies:
         study_queue.put(new_studies)
+        log(
+            f"Queued {len(new_studies)} poll-detected study/studies "
+            "for automatic opening."
+        )
     return len(new_studies)
 
 
