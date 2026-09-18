@@ -1,7 +1,10 @@
 import json
 import queue
 import socket
+import sqlite3
+import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import call, patch
@@ -54,6 +57,88 @@ class BrowserGuardTests(unittest.TestCase):
 
         self.assertIn('const targetStudyMaxAgeMs = 15000;', script)
 
+    def test_guard_collects_each_requested_button_failure_state(self) -> None:
+        script = monitor.build_persistent_take_part_script()
+
+        for state in (
+            "button_not_found",
+            "button_disabled",
+            "button_hidden",
+            "possible_iframe",
+            "text_not_recognized",
+            "button_clickable",
+        ):
+            self.assertIn(f'"{state}"', script)
+        self.assertIn("frame.contentDocument", script)
+        self.assertIn('control.scrollIntoView({block: "center", inline: "center"})', script)
+        self.assertIn("new MutationObserver", script)
+        self.assertIn("PROLIFIC_TAKE_PART_NO_RESPONSE", script)
+
+
+class DiagnosticStoreTests(unittest.TestCase):
+    def test_records_deduplicated_lifecycle_and_final_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = monitor.DiagnosticStore(Path(temp_dir) / "diagnostics.sqlite3")
+            attempt_id = store.begin_attempt("study-1", "Test study")
+
+            self.assertTrue(
+                store.record_event(
+                    attempt_id,
+                    "button_disabled",
+                    "button_search",
+                    {"disabledButtonCount": 1},
+                )
+            )
+            self.assertFalse(
+                store.record_event(
+                    attempt_id,
+                    "button_disabled",
+                    "button_search",
+                    {"disabledButtonCount": 1},
+                )
+            )
+            self.assertTrue(store.complete_attempt(attempt_id, "study_full"))
+
+            attempts = store.recent_attempts()
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(attempts[0]["final_result"], "study_full")
+            self.assertEqual(
+                [event["event_type"] for event in attempts[0]["events"]],
+                ["study_detected", "button_disabled", "study_full"],
+            )
+
+    def test_cleanup_securely_removes_attempts_older_than_three_days(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "diagnostics.sqlite3"
+            store = monitor.DiagnosticStore(database_path, retention_hours=72)
+            old_attempt_id = store.begin_attempt("old", "Old study")
+            recent_attempt_id = store.begin_attempt("recent", "Recent study")
+            old_epoch = time.time() - 73 * 3600
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute(
+                    "UPDATE attempts SET detected_at_epoch = ? WHERE id = ?",
+                    (old_epoch, old_attempt_id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(store.cleanup(), 1)
+            attempts = store.recent_attempts()
+            self.assertEqual([attempt["id"] for attempt in attempts], [recent_attempt_id])
+            connection = store._connect()
+            try:
+                orphan_count = connection.execute(
+                    "SELECT COUNT(*) FROM attempt_events WHERE attempt_id = ?",
+                    (old_attempt_id,),
+                ).fetchone()[0]
+                secure_delete = connection.execute("PRAGMA secure_delete").fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(orphan_count, 0)
+            self.assertEqual(secure_delete, 1)
+
 
 class BrowserStudyQueueTests(unittest.TestCase):
     def test_browser_detected_studies_are_forwarded_to_auto_open_queue(self) -> None:
@@ -101,6 +186,41 @@ class BrowserStudyQueueTests(unittest.TestCase):
                 {"id": "study-2", "title": "Second study"},
             ]
         )
+
+        class FakeDiagnosticStore:
+            def __init__(self) -> None:
+                self.started: list[tuple[int, str, str]] = []
+                self.events: list[tuple[int, str, str]] = []
+                self.completed: list[tuple[int, str]] = []
+
+            def begin_attempt(self, study_id: str, title: str, source: str) -> int:
+                attempt_id = len(self.started) + 1
+                self.started.append((attempt_id, study_id, title))
+                return attempt_id
+
+            def record_event(
+                self,
+                attempt_id: int,
+                event_type: str,
+                stage: str,
+                _details: dict[str, object] | None = None,
+            ) -> bool:
+                self.events.append((attempt_id, event_type, stage))
+                return True
+
+            def complete_attempt(
+                self,
+                attempt_id: int,
+                final_result: str,
+                _details: dict[str, object] | None = None,
+            ) -> bool:
+                self.completed.append((attempt_id, final_result))
+                return True
+
+            def cleanup(self) -> int:
+                return 0
+
+        diagnostic_store = FakeDiagnosticStore()
 
         class FakeDevTools:
             instance: "FakeDevTools | None" = None
@@ -160,6 +280,11 @@ class BrowserStudyQueueTests(unittest.TestCase):
                 "prolific_target_changed",
                 return_value=False,
             ),
+            patch.object(
+                monitor,
+                "create_diagnostic_store",
+                return_value=diagnostic_store,
+            ),
             patch.object(monitor, "DevToolsWebSocket", FakeDevTools),
             patch.object(monitor, "handle_reservation_result") as reservation_result,
         ):
@@ -184,6 +309,17 @@ class BrowserStudyQueueTests(unittest.TestCase):
                 call(Path("prolific-monitor.json"), reserved=False),
                 call(Path("prolific-monitor.json"), reserved=True),
             ],
+        )
+        self.assertEqual(
+            diagnostic_store.started,
+            [
+                (1, "study-1", "First study"),
+                (2, "study-2", "Second study"),
+            ],
+        )
+        self.assertEqual(
+            diagnostic_store.completed,
+            [(1, "study_full"), (2, "reserved")],
         )
 
     def test_browser_watcher_releases_a_stale_target_after_twenty_seconds(

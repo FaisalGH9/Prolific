@@ -5,6 +5,10 @@
     "token_source": "Set PROLIFIC_BEARER_TOKEN in your environment or .env file."
   },
   "poll_seconds": 20,
+  "diagnostics": {
+    "enabled": true,
+    "retention_hours": 72
+  },
   "request": {
     "body": null,
     "headers": {

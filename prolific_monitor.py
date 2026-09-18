@@ -21,6 +21,7 @@ import queue
 import shlex
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -42,6 +43,7 @@ from urllib.request import Request, urlopen
 DEFAULT_CONFIG = "prolific-monitor.json"
 DEFAULT_STATE = "state/prolific-state.json"
 DEFAULT_MANUAL_ONLY_NOTIFICATION_STATE = "state/manual-only-notifications.json"
+DEFAULT_DIAGNOSTIC_RETENTION_HOURS = 72
 ENV_FILE = ".env"
 DEFAULT_BROWSER_PORT = 9222
 DEFAULT_BROWSER_PROFILE = ".browser-profile"
@@ -52,6 +54,263 @@ MANUAL_ONLY_STUDY_RULE_ENABLED = True
 # MANUAL_ONLY_STUDY_RULE_ENABLED = False
 
 STATE_LOCK = threading.RLock()
+
+
+def default_diagnostics_path() -> Path:
+    """Keep short-lived diagnostics outside folders commonly synchronized to cloud storage."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "ProlificMonitor" / "diagnostics.sqlite3"
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home) / "prolific-monitor" / "diagnostics.sqlite3"
+    return Path.home() / ".local" / "state" / "prolific-monitor" / "diagnostics.sqlite3"
+
+
+class DiagnosticStore:
+    """Short-lived, structured records for browser reservation attempts."""
+
+    def __init__(self, path: Path, retention_hours: int = DEFAULT_DIAGNOSTIC_RETENTION_HOURS):
+        self.path = path
+        self.retention_hours = max(1, int(retention_hours))
+        self._lock = threading.RLock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+        self.cleanup()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA secure_delete = ON")
+        return connection
+
+    def _initialize(self) -> None:
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS attempts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        study_id TEXT NOT NULL DEFAULT '',
+                        title TEXT NOT NULL DEFAULT '',
+                        source TEXT NOT NULL DEFAULT 'browser',
+                        detected_at TEXT NOT NULL,
+                        detected_at_epoch REAL NOT NULL,
+                        completed_at TEXT,
+                        completed_at_epoch REAL,
+                        current_stage TEXT NOT NULL DEFAULT 'detected',
+                        final_result TEXT,
+                        final_details_json TEXT NOT NULL DEFAULT '{}'
+                    );
+                    CREATE TABLE IF NOT EXISTS attempt_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        attempt_id INTEGER NOT NULL,
+                        occurred_at TEXT NOT NULL,
+                        occurred_at_epoch REAL NOT NULL,
+                        event_type TEXT NOT NULL,
+                        stage TEXT NOT NULL,
+                        details_json TEXT NOT NULL DEFAULT '{}',
+                        FOREIGN KEY (attempt_id) REFERENCES attempts(id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_attempts_detected_at_epoch
+                        ON attempts(detected_at_epoch);
+                    CREATE INDEX IF NOT EXISTS idx_attempt_events_attempt_id
+                        ON attempt_events(attempt_id, id);
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+    @staticmethod
+    def _details_json(details: dict[str, Any] | None) -> str:
+        return json.dumps(details or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def begin_attempt(self, study_id_value: str, title: str, source: str = "browser") -> int:
+        now_epoch = time.time()
+        now = utc_now()
+        with self._lock:
+            connection = self._connect()
+            try:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO attempts (
+                        study_id, title, source, detected_at, detected_at_epoch, current_stage
+                    ) VALUES (?, ?, ?, ?, ?, 'detected')
+                    """,
+                    (study_id_value, title, source, now, now_epoch),
+                )
+                attempt_id = int(cursor.lastrowid)
+                connection.execute(
+                    """
+                    INSERT INTO attempt_events (
+                        attempt_id, occurred_at, occurred_at_epoch, event_type, stage, details_json
+                    ) VALUES (?, ?, ?, 'study_detected', 'detected', '{}')
+                    """,
+                    (attempt_id, now, now_epoch),
+                )
+                connection.commit()
+                return attempt_id
+            finally:
+                connection.close()
+
+    def record_event(
+        self,
+        attempt_id: int,
+        event_type: str,
+        stage: str,
+        details: dict[str, Any] | None = None,
+    ) -> bool:
+        details_json = self._details_json(details)
+        now_epoch = time.time()
+        now = utc_now()
+        with self._lock:
+            connection = self._connect()
+            try:
+                previous = connection.execute(
+                    """
+                    SELECT event_type, stage, details_json
+                    FROM attempt_events
+                    WHERE attempt_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (attempt_id,),
+                ).fetchone()
+                if previous and (
+                    previous["event_type"], previous["stage"], previous["details_json"]
+                ) == (event_type, stage, details_json):
+                    return False
+                connection.execute(
+                    """
+                    INSERT INTO attempt_events (
+                        attempt_id, occurred_at, occurred_at_epoch, event_type, stage, details_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (attempt_id, now, now_epoch, event_type, stage, details_json),
+                )
+                connection.execute(
+                    "UPDATE attempts SET current_stage = ? WHERE id = ? AND completed_at IS NULL",
+                    (stage, attempt_id),
+                )
+                connection.commit()
+                return True
+            finally:
+                connection.close()
+
+    def complete_attempt(
+        self,
+        attempt_id: int,
+        final_result: str,
+        details: dict[str, Any] | None = None,
+    ) -> bool:
+        details_json = self._details_json(details)
+        now_epoch = time.time()
+        now = utc_now()
+        with self._lock:
+            connection = self._connect()
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE attempts
+                    SET completed_at = ?, completed_at_epoch = ?, current_stage = 'complete',
+                        final_result = ?, final_details_json = ?
+                    WHERE id = ? AND completed_at IS NULL
+                    """,
+                    (now, now_epoch, final_result, details_json, attempt_id),
+                )
+                if not cursor.rowcount:
+                    return False
+                connection.execute(
+                    """
+                    INSERT INTO attempt_events (
+                        attempt_id, occurred_at, occurred_at_epoch, event_type, stage, details_json
+                    ) VALUES (?, ?, ?, ?, 'complete', ?)
+                    """,
+                    (attempt_id, now, now_epoch, final_result, details_json),
+                )
+                connection.commit()
+                return True
+            finally:
+                connection.close()
+
+    def cleanup(self, now_epoch: float | None = None) -> int:
+        cutoff = (time.time() if now_epoch is None else now_epoch) - self.retention_hours * 3600
+        with self._lock:
+            connection = self._connect()
+            try:
+                cursor = connection.execute(
+                    "DELETE FROM attempts WHERE detected_at_epoch < ?",
+                    (cutoff,),
+                )
+                deleted = int(cursor.rowcount)
+                connection.commit()
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                if deleted:
+                    connection.execute("VACUUM")
+                return deleted
+            finally:
+                connection.close()
+
+    def recent_attempts(self, hours: int | None = None) -> list[dict[str, Any]]:
+        window_hours = self.retention_hours if hours is None else max(1, int(hours))
+        cutoff = time.time() - window_hours * 3600
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT id, study_id, title, source, detected_at, completed_at,
+                           current_stage, final_result, final_details_json
+                    FROM attempts
+                    WHERE detected_at_epoch >= ?
+                    ORDER BY detected_at_epoch DESC, id DESC
+                    """,
+                    (cutoff,),
+                ).fetchall()
+                results: list[dict[str, Any]] = []
+                for row in rows:
+                    item = dict(row)
+                    item["final_details"] = json.loads(item.pop("final_details_json") or "{}")
+                    event_rows = connection.execute(
+                        """
+                        SELECT occurred_at, event_type, stage, details_json
+                        FROM attempt_events WHERE attempt_id = ? ORDER BY id
+                        """,
+                        (row["id"],),
+                    ).fetchall()
+                    item["events"] = [
+                        {
+                            "occurred_at": event["occurred_at"],
+                            "event_type": event["event_type"],
+                            "stage": event["stage"],
+                            "details": json.loads(event["details_json"] or "{}"),
+                        }
+                        for event in event_rows
+                    ]
+                    results.append(item)
+                return results
+            finally:
+                connection.close()
+
+
+def create_diagnostic_store(config: dict[str, Any]) -> DiagnosticStore | None:
+    settings = config.get("diagnostics")
+    if not isinstance(settings, dict) or not settings.get("enabled", True):
+        return None
+    try:
+        path = Path(str(settings.get("database_path") or default_diagnostics_path()))
+        retention_hours = int(
+            settings.get("retention_hours", DEFAULT_DIAGNOSTIC_RETENTION_HOURS)
+        )
+        return DiagnosticStore(path, retention_hours)
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        log(f"Could not initialize diagnostics database: {exc}")
+        return None
 
 
 def resolve_log_timezone() -> datetime.tzinfo:
@@ -266,6 +525,10 @@ def parse_curl(curl_text: str) -> dict[str, Any]:
         "request_timeout_seconds": 20,
         "studies_path": None,
         "state_file": DEFAULT_STATE,
+        "diagnostics": {
+            "enabled": True,
+            "retention_hours": DEFAULT_DIAGNOSTIC_RETENTION_HOURS,
+        },
         "telegram": {
             "bot_token": "${TELEGRAM_BOT_TOKEN}",
             "chat_id": "${TELEGRAM_CHAT_ID}",
@@ -297,6 +560,11 @@ def load_config(path: Path) -> dict[str, Any]:
     config.setdefault("request_timeout_seconds", 20)
     config.setdefault("state_file", DEFAULT_STATE)
     config.setdefault("telegram", {})
+    diagnostics = config.setdefault("diagnostics", {})
+    if isinstance(diagnostics, dict):
+        diagnostics.setdefault("enabled", True)
+        diagnostics.setdefault("database_path", str(default_diagnostics_path()))
+        diagnostics.setdefault("retention_hours", DEFAULT_DIAGNOSTIC_RETENTION_HOURS)
     browser = config.setdefault("browser", {})
     if isinstance(browser, dict):
         browser.setdefault("auto_take_part", True)
@@ -699,14 +967,21 @@ def watch_browser_tokens(
     pending_studies: deque[dict[str, Any]] = deque()
     active_target = False
     active_target_deadline: float | None = None
+    active_result_deadline: float | None = None
+    active_attempt_id: int | None = None
+    active_failure_reason: str | None = None
     target_timeout_seconds = 20
+    diagnostic_store: DiagnosticStore | None = None
+    next_diagnostic_cleanup_at = time.time() + 3600
     if config_path is not None:
         try:
-            browser_config = load_config(config_path).get("browser")
+            watcher_config = load_config(config_path)
+            browser_config = watcher_config.get("browser")
             if isinstance(browser_config, dict):
                 target_timeout_seconds = int(
                     browser_config.get("target_study_timeout_seconds", 20)
                 )
+            diagnostic_store = create_diagnostic_store(watcher_config)
         except (MonitorError, TypeError, ValueError) as exc:
             log(f"Could not read browser target timeout; using 20 seconds: {exc}")
     click_guard_marker = "PROLIFIC_AUTO_TAKE_PART_CLICKED"
@@ -717,6 +992,31 @@ def watch_browser_tokens(
     target_open_marker = "PROLIFIC_TARGET_STUDY_OPEN_ATTEMPT"
     target_missing_marker = "PROLIFIC_TARGET_STUDY_NOT_FOUND"
     target_expired_marker = "PROLIFIC_TARGET_STUDY_EXPIRED"
+    diagnostic_marker = "PROLIFIC_TAKE_PART_DIAGNOSTIC"
+    no_response_marker = "PROLIFIC_TAKE_PART_NO_RESPONSE"
+
+    def record_diagnostic(
+        event_type: str,
+        stage: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if diagnostic_store is None or active_attempt_id is None:
+            return
+        try:
+            diagnostic_store.record_event(active_attempt_id, event_type, stage, details)
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            log(f"Could not record browser diagnostic: {exc}")
+
+    def complete_diagnostic(
+        final_result: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if diagnostic_store is None or active_attempt_id is None:
+            return
+        try:
+            diagnostic_store.complete_attempt(active_attempt_id, final_result, details)
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            log(f"Could not complete browser diagnostic: {exc}")
 
     duplicates_closed = close_duplicate_prolific_targets(port, websocket_url)
     if duplicates_closed:
@@ -731,6 +1031,26 @@ def watch_browser_tokens(
         log("Watching browser network requests for fresh Prolific tokens.")
 
         while stop_event is None or not stop_event.is_set():
+            if diagnostic_store is not None and time.time() >= next_diagnostic_cleanup_at:
+                try:
+                    diagnostic_store.cleanup()
+                except (OSError, sqlite3.Error) as exc:
+                    log(f"Could not clean diagnostics database: {exc}")
+                next_diagnostic_cleanup_at = time.time() + 3600
+
+            if (
+                active_target
+                and active_result_deadline is not None
+                and time.monotonic() >= active_result_deadline
+            ):
+                log("No Prolific reservation result appeared within 120 seconds.")
+                complete_diagnostic("click_no_response")
+                active_target = False
+                active_target_deadline = None
+                active_result_deadline = None
+                active_attempt_id = None
+                active_failure_reason = None
+
             if (
                 active_target
                 and active_target_deadline is not None
@@ -740,8 +1060,12 @@ def watch_browser_tokens(
                     f"Browser target timed out after {target_timeout_seconds} seconds; "
                     "advancing to the next queued study."
                 )
+                complete_diagnostic(active_failure_reason or "card_not_found")
                 active_target = False
                 active_target_deadline = None
+                active_result_deadline = None
+                active_attempt_id = None
+                active_failure_reason = None
                 devtools.command(
                     "Runtime.evaluate",
                     {
@@ -762,6 +1086,7 @@ def watch_browser_tokens(
 
             if not active_target and pending_studies:
                 if prolific_target_changed(port, websocket_url):
+                    complete_diagnostic("browser_disconnected")
                     raise MonitorError("Watcher is no longer on Prolific; reconnecting the auto-click guard.")
                 target_study = pending_studies.popleft()
                 target_title = first_value(
@@ -771,6 +1096,18 @@ def watch_browser_tokens(
                 )
                 target_id = study_id(target_study) or ""
                 if target_title or target_id:
+                    if diagnostic_store is not None:
+                        try:
+                            active_attempt_id = diagnostic_store.begin_attempt(
+                                target_id,
+                                target_title,
+                                source="browser",
+                            )
+                        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+                            active_attempt_id = None
+                            log(f"Could not begin browser diagnostic: {exc}")
+                    active_failure_reason = None
+                    active_result_deadline = None
                     devtools.command(
                         "Runtime.evaluate",
                         {
@@ -794,6 +1131,7 @@ def watch_browser_tokens(
                     )
                     target_label = target_title or target_id
                     log(f"Queued study detected; opening it in browser: {target_label}")
+                    record_diagnostic("target_queued", "card_search")
                     devtools.command("Page.bringToFront")
                     devtools.command("Page.navigate", {"url": "https://app.prolific.com/studies"})
                 else:
@@ -803,12 +1141,16 @@ def watch_browser_tokens(
                 message = devtools.recv_json()
             except socket.timeout:
                 if prolific_target_changed(port, websocket_url):
+                    complete_diagnostic("browser_disconnected")
                     raise MonitorError("Watcher is no longer on Prolific; reconnecting the auto-click guard.")
                 duplicates_closed = close_duplicate_prolific_targets(port, websocket_url)
                 if duplicates_closed:
                     log(f"Closed {duplicates_closed} duplicate Prolific tab(s).")
                 install_take_part_guard(devtools, config_path, announce=False)
                 continue
+            except (MonitorError, OSError, TimeoutError):
+                complete_diagnostic("browser_disconnected")
+                raise
             method = message.get("method")
             params = message.get("params") or {}
 
@@ -827,32 +1169,83 @@ def watch_browser_tokens(
                 if click_guard_marker in values:
                     log("Take part button clicked; waiting for Prolific to confirm the reservation.")
                     active_target_deadline = None
+                    active_result_deadline = time.monotonic() + 120
+                    record_diagnostic("button_clicked", "reservation")
                 if reserved_marker in values:
+                    complete_diagnostic("reserved")
                     handle_reservation_result(config_path, reserved=True)
                     active_target = False
                     active_target_deadline = None
+                    active_result_deadline = None
+                    active_attempt_id = None
+                    active_failure_reason = None
                     pending_studies.clear()
                 if full_marker in values:
+                    complete_diagnostic("study_full")
                     handle_reservation_result(config_path, reserved=False)
                     active_target = False
                     active_target_deadline = None
+                    active_result_deadline = None
+                    active_attempt_id = None
+                    active_failure_reason = None
                 if high_demand_marker in values:
                     log("High demand detected; automatically retrying the Take part button.")
+                    record_diagnostic("high_demand", "retry")
                 if manual_only_marker in values:
+                    complete_diagnostic("manual_only")
                     handle_manual_only_study(config_path, values)
                     active_target = False
                     active_target_deadline = None
+                    active_result_deadline = None
+                    active_attempt_id = None
+                    active_failure_reason = None
                 if target_open_marker in values:
                     log("Target study card clicked; waiting for the Take part button.")
+                    record_diagnostic("card_open_attempt", "detail_open")
                 if target_missing_marker in values:
                     log("Target study card not found yet; continuing to retry.")
+                    if active_failure_reason is None:
+                        active_failure_reason = "card_not_found"
+                    record_diagnostic("card_not_found", "card_search")
+                if diagnostic_marker in values:
+                    marker_index = values.index(diagnostic_marker)
+                    raw_details = values[marker_index + 1] if marker_index + 1 < len(values) else "{}"
+                    try:
+                        diagnostic_details = json.loads(raw_details)
+                    except json.JSONDecodeError:
+                        diagnostic_details = {"raw": raw_details[:500]}
+                    if not isinstance(diagnostic_details, dict):
+                        diagnostic_details = {"value": diagnostic_details}
+                    diagnostic_status = str(diagnostic_details.pop("status", "button_not_found"))
+                    diagnostic_stage = str(diagnostic_details.pop("stage", "button_search"))
+                    record_diagnostic(diagnostic_status, diagnostic_stage, diagnostic_details)
+                    if diagnostic_status in {
+                        "button_not_found",
+                        "button_disabled",
+                        "button_hidden",
+                        "possible_iframe",
+                        "text_not_recognized",
+                    }:
+                        active_failure_reason = diagnostic_status
+                if no_response_marker in values:
+                    log("No Prolific reservation result appeared within 120 seconds.")
+                    complete_diagnostic("click_no_response")
+                    active_target = False
+                    active_target_deadline = None
+                    active_result_deadline = None
+                    active_attempt_id = None
+                    active_failure_reason = None
                 if target_expired_marker in values:
                     log(
                         f"Target study expired after {target_timeout_seconds} seconds; "
                         "it is no longer available."
                     )
+                    complete_diagnostic(active_failure_reason or "card_not_found")
                     active_target = False
                     active_target_deadline = None
+                    active_result_deadline = None
+                    active_attempt_id = None
+                    active_failure_reason = None
 
             if "id" in message:
                 command_id = int(message["id"])
@@ -1113,6 +1506,8 @@ def build_persistent_take_part_script(
   const targetOpenMarker = "PROLIFIC_TARGET_STUDY_OPEN_ATTEMPT";
   const targetMissingMarker = "PROLIFIC_TARGET_STUDY_NOT_FOUND";
   const targetExpiredMarker = "PROLIFIC_TARGET_STUDY_EXPIRED";
+  const diagnosticMarker = "PROLIFIC_TAKE_PART_DIAGNOSTIC";
+  const noResponseMarker = "PROLIFIC_TAKE_PART_NO_RESPONSE";
   const targetText = "take part in this study";
   const targetStudyMaxAgeMs = __TARGET_STUDY_MAX_AGE_MS__;
   const manualOnlyEnabled = __MANUAL_ONLY_ENABLED__;
@@ -1143,6 +1538,7 @@ def build_persistent_take_part_script(
   let retryMode = false;
   let nextRetryAt = 0;
   let lastHighDemandNoticeAt = 0;
+  let lastDiagnosticKey = "";
   const normalize = (value) => (value || "").replace(/\\s+/g, " ").trim().toLowerCase();
   let targetStudyTitleRaw = "";
   let targetStudyTitle = "";
@@ -1221,6 +1617,82 @@ def build_persistent_take_part_script(
     }
     return found;
   };
+  const reportDiagnostic = (status, details = {}) => {
+    const payload = {
+      status,
+      stage: "button_search",
+      pagePath: location.pathname,
+      ...details
+    };
+    const key = JSON.stringify(payload);
+    if (key === lastDiagnosticKey) return;
+    lastDiagnosticKey = key;
+    console.log(diagnosticMarker, key);
+  };
+  const iframeStats = () => {
+    let count = 0;
+    let inaccessibleCount = 0;
+    for (const root of roots()) {
+      for (const frame of root.querySelectorAll("iframe")) {
+        count += 1;
+        try {
+          if (!frame.contentDocument) inaccessibleCount += 1;
+        } catch (_) {
+          inaccessibleCount += 1;
+        }
+      }
+    }
+    return {iframeCount: count, inaccessibleIframeCount: inaccessibleCount};
+  };
+  const takePartSnapshot = () => {
+    const matching = [];
+    const visibleLabels = [];
+    for (const root of roots()) {
+      for (const control of root.querySelectorAll(
+        "button, a, [role='button'], input[type='button'], input[type='submit']"
+      )) {
+        const label = control.value || control.getAttribute("aria-label") ||
+          control.innerText || control.textContent || "";
+        const normalizedLabel = normalize(label);
+        const rect = control.getBoundingClientRect();
+        const rendered = Boolean(rect.width && rect.height);
+        if (rendered && normalizedLabel && visibleLabels.length < 12) {
+          visibleLabels.push(normalizedLabel.slice(0, 80));
+        }
+        if (normalizedLabel.includes(targetText)) {
+          matching.push({disabled: Boolean(control.disabled), rendered});
+        }
+      }
+    }
+    const details = {
+      matchingButtonCount: matching.length,
+      disabledButtonCount: matching.filter((item) => item.disabled).length,
+      hiddenButtonCount: matching.filter((item) => !item.rendered).length,
+      ...iframeStats()
+    };
+    if (matching.some((item) => item.rendered && !item.disabled)) {
+      return {status: "button_clickable", details};
+    }
+    if (matching.some((item) => !item.rendered && !item.disabled)) {
+      return {status: "button_hidden", details};
+    }
+    if (matching.some((item) => item.disabled)) {
+      return {status: "button_disabled", details};
+    }
+    const suggestiveLabels = visibleLabels.filter((label) =>
+      /take part|participat|reserve|join|start study/.test(label)
+    );
+    if (suggestiveLabels.length) {
+      return {
+        status: "text_not_recognized",
+        details: {...details, visibleButtonLabels: suggestiveLabels}
+      };
+    }
+    if (details.inaccessibleIframeCount) {
+      return {status: "possible_iframe", details};
+    }
+    return {status: "button_not_found", details};
+  };
   const resultTexts = () => {
     const selectors = [
       "[role='alert']",
@@ -1287,6 +1759,18 @@ def build_persistent_take_part_script(
     const matches = targetTitleTokens.filter((token) => availableTokens.has(token)).length;
     return matches / targetTitleTokens.length;
   };
+  const pageHeadingMatchesTarget = () => {
+    if (!targetStudyTitle) return false;
+    for (const root of roots()) {
+      for (const heading of root.querySelectorAll("h1, h2, [role='heading']")) {
+        const rect = heading.getBoundingClientRect();
+        if (!rect.width || !rect.height) continue;
+        const text = heading.innerText || heading.textContent || "";
+        if (titleSimilarity(text) >= 0.75) return true;
+      }
+    }
+    return false;
+  };
   const identityValues = (element) => {
     const values = [];
     let current = element;
@@ -1346,6 +1830,10 @@ def build_persistent_take_part_script(
     }
     if (targetStudySelected) {
       if (Date.now() < targetReadyAt) return false;
+      const snapshot = takePartSnapshot();
+      if (snapshot.details.matchingButtonCount || pageHeadingMatchesTarget()) {
+        return true;
+      }
       if (targetSelectionAttemptedAt && Date.now() - targetSelectionAttemptedAt < 2000) {
         return false;
       }
@@ -1449,12 +1937,15 @@ def build_persistent_take_part_script(
     if (pendingAt && Date.now() - pendingAt >= 120000) {
       waitingForResult = false;
       writePendingAt(0);
+      console.log(noResponseMarker);
     }
     return false;
   };
   const clickCandidate = () => {
     if (!selectTargetStudy()) return false;
     if (isManualOnlyStudy()) return false;
+    const snapshot = takePartSnapshot();
+    reportDiagnostic(snapshot.status, snapshot.details);
     for (const root of roots()) {
       const controls = root.querySelectorAll(
         "button, a, [role='button'], input[type='button'], input[type='submit']"
@@ -2010,6 +2501,44 @@ def command_test_telegram(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_diagnostics(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config))
+    store = create_diagnostic_store(config)
+    if store is None:
+        raise MonitorError("Diagnostics are disabled or the diagnostics database is unavailable.")
+    hours = min(store.retention_hours, max(1, int(args.hours)))
+    attempts = store.recent_attempts(hours)
+    print(f"Prolific diagnostics — last {hours} hour(s)")
+    print(f"Database: {store.path}")
+    print(f"Attempts: {len(attempts)}")
+    if not attempts:
+        print("No diagnostic attempts were recorded in this period.")
+        return 0
+
+    counts: dict[str, int] = {}
+    for attempt in attempts:
+        result = str(attempt.get("final_result") or "in_progress")
+        counts[result] = counts.get(result, 0) + 1
+    print("Results: " + ", ".join(f"{name}={count}" for name, count in sorted(counts.items())))
+
+    failures = [attempt for attempt in attempts if attempt.get("final_result") != "reserved"]
+    if not failures:
+        print("No unsuccessful attempts were recorded.")
+        return 0
+
+    print("\nUnsuccessful attempts:")
+    for attempt in failures:
+        label = attempt.get("title") or attempt.get("study_id") or "Untitled study"
+        result = attempt.get("final_result") or f"in_progress:{attempt.get('current_stage')}"
+        print(f"\n[{attempt['detected_at']}] {label}")
+        print(f"  Result: {result}")
+        for event in attempt.get("events", []):
+            details = event.get("details") or {}
+            detail_text = f" {json.dumps(details, ensure_ascii=False, sort_keys=True)}" if details else ""
+            print(f"  {event['occurred_at']}  {event['event_type']}{detail_text}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Monitor Prolific studies and notify Telegram.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2067,6 +2596,19 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_parser = subparsers.add_parser("test-telegram", help="Send a Telegram test message.")
     telegram_parser.add_argument("--config", default=DEFAULT_CONFIG, help="Config file to use.")
     telegram_parser.set_defaults(func=command_test_telegram)
+
+    diagnostics_parser = subparsers.add_parser(
+        "diagnostics",
+        help="Show browser reservation attempts retained in the diagnostics database.",
+    )
+    diagnostics_parser.add_argument("--config", default=DEFAULT_CONFIG, help="Config file to use.")
+    diagnostics_parser.add_argument(
+        "--hours",
+        type=int,
+        default=DEFAULT_DIAGNOSTIC_RETENTION_HOURS,
+        help="Recent hours to include (default: 72).",
+    )
+    diagnostics_parser.set_defaults(func=command_diagnostics)
 
     return parser
 
