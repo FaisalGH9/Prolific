@@ -1511,7 +1511,10 @@ def build_persistent_take_part_script(
   const targetText = "take part in this study";
   const targetStudyMaxAgeMs = __TARGET_STUDY_MAX_AGE_MS__;
   const manualOnlyEnabled = __MANUAL_ONLY_ENABLED__;
-  const manualOnlyTitle = "saudi sexism detection";
+  const manualOnlyTitles = [
+    "saudi sexism detection",
+    "sexism detection cross annotation"
+  ];
   const manualOnlyResearcher = "qmul.ac.uk";
   const manualOnlyReportedKey = "prolificManualOnlyReportedUrl";
   const clickedControls = new WeakSet();
@@ -1883,8 +1886,9 @@ def build_persistent_take_part_script(
     const detail = activeDetailContext();
     const selectedTitle = targetStudyTitle || normalize(detail.headingTexts.join(" "));
     const selectedTitleDisplay = targetStudyTitleRaw || detail.headingTexts.join(" ");
+    const selectedTitleSimplified = simplifyTitle(selectedTitle);
     if (
-      !selectedTitle.includes(manualOnlyTitle) ||
+      !manualOnlyTitles.some((title) => selectedTitleSimplified.includes(title)) ||
       !detail.text.includes(manualOnlyResearcher)
     ) {
       return false;

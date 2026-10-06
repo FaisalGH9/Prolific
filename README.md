@@ -30,8 +30,9 @@ This version includes:
 - Automatic deletion and database compaction for diagnostic records older than
   72 hours.
 - Cleanup of duplicate Prolific browser tabs.
-- A currently enabled manual-only safeguard for **Saudi Sexism Detection** by
-  `qmul.ac.uk`. The monitor reports this study but skips automatic reservation.
+- A currently enabled manual-only safeguard for **Saudi Sexism Detection** and
+  numbered **Sexism Detection - Cross-annotation** studies by `qmul.ac.uk`.
+  The monitor reports these studies but skips automatic reservation.
   Set `MANUAL_ONLY_STUDY_RULE_ENABLED = False` to disable this rule.
 
 ## Files

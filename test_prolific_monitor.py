@@ -46,6 +46,12 @@ class BrowserGuardTests(unittest.TestCase):
             script,
         )
         self.assertIn('const manualOnlyEnabled = true;', script)
+        self.assertIn('"saudi sexism detection"', script)
+        self.assertIn('"sexism detection cross annotation"', script)
+        self.assertIn(
+            'manualOnlyTitles.some((title) => selectedTitleSimplified.includes(title))',
+            script,
+        )
         self.assertIn('if (isManualOnlyStudy()) return false;', script)
         self.assertIn('const activeStudyMatchesTarget = () => {', script)
         self.assertIn('if (activeStudyMatchesTarget()) {', script)
