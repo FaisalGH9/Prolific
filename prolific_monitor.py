@@ -45,8 +45,8 @@ DEFAULT_STATE = "state/prolific-state.json"
 DEFAULT_MANUAL_ONLY_NOTIFICATION_STATE = "state/manual-only-notifications.json"
 DEFAULT_DIAGNOSTIC_RETENTION_HOURS = 72
 ENV_FILE = ".env"
-DEFAULT_BROWSER_PORT = 9222
-DEFAULT_BROWSER_PROFILE = ".browser-profile"
+DEFAULT_BROWSER_PORT = 9223
+DEFAULT_BROWSER_PROFILE = ".browser-profile-chrome"
 PROLIFIC_STUDIES_URL_PART = "internal-api.prolific.com/api/v1/participant/studies"
 
 # To disable this rule, comment the True line and uncomment the False line.
@@ -570,6 +570,7 @@ def load_config(path: Path) -> dict[str, Any]:
         browser.setdefault("auto_take_part", True)
         browser.setdefault("take_part_timeout_seconds", 15)
         browser.setdefault("target_study_timeout_seconds", 20)
+        browser.setdefault("page_load_timeout_seconds", 120)
     return config
 
 
@@ -760,10 +761,10 @@ def find_browser_executable(explicit_path: str | None = None) -> str:
 
     candidates = [
         os.environ.get("PROLIFIC_BROWSER_PATH", ""),
-        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         "/usr/bin/brave-browser",
@@ -966,11 +967,19 @@ def watch_browser_tokens(
     pending_clicks: dict[int, str] = {}
     pending_studies: deque[dict[str, Any]] = deque()
     active_target = False
+    active_outcome_key = ""
+    completed_outcome_keys: set[str] = set()
     active_target_deadline: float | None = None
     active_result_deadline: float | None = None
+    active_load_deadline: float | None = None
+    active_phase = "search"
+    search_remaining = 20.0
+    result_remaining = 120.0
+    main_frame_id: str | None = None
     active_attempt_id: int | None = None
     active_failure_reason: str | None = None
     target_timeout_seconds = 20
+    page_load_timeout_seconds = 120
     diagnostic_store: DiagnosticStore | None = None
     next_diagnostic_cleanup_at = time.time() + 3600
     if config_path is not None:
@@ -981,6 +990,9 @@ def watch_browser_tokens(
                 target_timeout_seconds = int(
                     browser_config.get("target_study_timeout_seconds", 20)
                 )
+                page_load_timeout_seconds = max(1, int(
+                    browser_config.get("page_load_timeout_seconds", 120)
+                ))
             diagnostic_store = create_diagnostic_store(watcher_config)
         except (MonitorError, TypeError, ValueError) as exc:
             log(f"Could not read browser target timeout; using 20 seconds: {exc}")
@@ -994,6 +1006,8 @@ def watch_browser_tokens(
     target_expired_marker = "PROLIFIC_TARGET_STUDY_EXPIRED"
     diagnostic_marker = "PROLIFIC_TAKE_PART_DIAGNOSTIC"
     no_response_marker = "PROLIFIC_TAKE_PART_NO_RESPONSE"
+    ui_ready_marker = "PROLIFIC_STUDY_UI_READY"
+    ui_loading_marker = "PROLIFIC_STUDY_UI_LOADING"
 
     def record_diagnostic(
         event_type: str,
@@ -1018,6 +1032,102 @@ def watch_browser_tokens(
         except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
             log(f"Could not complete browser diagnostic: {exc}")
 
+    def finish_target(result: str, reason: str | None = None) -> None:
+        nonlocal active_target, active_target_deadline, active_result_deadline
+        nonlocal active_attempt_id, active_failure_reason, active_load_deadline
+        if not active_target:
+            return
+        # Clear the active flag before delivery so repeated browser events or
+        # the Python fallback deadline cannot send a second terminal result.
+        active_target = False
+        if active_outcome_key:
+            completed_outcome_keys.add(active_outcome_key)
+            # Persist Python fallback results too. A guard installed after a
+            # slow navigation must not resume this already-finished attempt.
+            try:
+                devtools.command("Runtime.evaluate", {"expression": (
+                    f"if (sessionStorage.getItem('prolificAutoAttemptKey') === {json.dumps(active_outcome_key)}) {{"
+                    f"sessionStorage.setItem('prolificAutoReportedOutcomeKey', {json.dumps(active_outcome_key)});"
+                    "sessionStorage.removeItem('prolificAutoTakePartPendingAt');"
+                    "sessionStorage.removeItem('prolificAutoTargetStudyTitle');"
+                    "sessionStorage.removeItem('prolificAutoTargetStudyId');}"
+                )})
+            except (MonitorError, OSError, TimeoutError) as exc:
+                log(f"Could not persist browser attempt completion: {exc}")
+        complete_diagnostic(reason or result)
+        active_target_deadline = None
+        active_result_deadline = None
+        active_load_deadline = None
+        active_attempt_id = None
+        active_failure_reason = None
+        if result == "reserved":
+            handle_reservation_result(config_path, reserved=True)
+            pending_studies.clear()
+        elif result == "study_full":
+            handle_reservation_result(config_path, reserved=False)
+        else:
+            if reason == "page_load_timeout":
+                handle_unconfirmed_reservation(config_path, page_loading=True)
+            else:
+                handle_unconfirmed_reservation(config_path)
+
+    def pause_for_loading() -> None:
+        nonlocal active_target_deadline, active_result_deadline, active_load_deadline
+        nonlocal search_remaining, result_remaining
+        if not active_target:
+            return
+        now = time.monotonic()
+        if active_target_deadline is not None:
+            search_remaining = max(0.0, active_target_deadline - now)
+        if active_result_deadline is not None:
+            result_remaining = max(0.0, active_result_deadline - now)
+        active_target_deadline = None
+        active_result_deadline = None
+        if active_load_deadline is None:
+            active_load_deadline = now + page_load_timeout_seconds
+            log("Study page is loading; search/result timeout paused.")
+
+    def resume_after_loading(values: list[str]) -> None:
+        nonlocal active_load_deadline, active_target_deadline, active_result_deadline
+        nonlocal active_phase, search_remaining, result_remaining
+        index = values.index(ui_ready_marker)
+        details = values[index + 2:]
+        if details and details[0] in {"search", "result"}:
+            active_phase = details[0]
+        if len(details) >= 3:
+            try:
+                search_remaining = min(search_remaining, max(0.0, float(details[1]) / 1000))
+                result_remaining = min(result_remaining, max(0.0, float(details[2]) / 1000))
+            except ValueError:
+                pass
+        now = time.monotonic()
+        if active_load_deadline is not None:
+            log("Study page is ready; search/result timeout resumed.")
+        active_load_deadline = None
+        if active_phase == "result":
+            active_target_deadline = None
+            active_result_deadline = now + result_remaining
+        else:
+            active_result_deadline = None
+            active_target_deadline = now + search_remaining
+
+    def matches_attempt(values: list[str], marker: str) -> bool:
+        nonlocal active_target, active_outcome_key
+        index = values.index(marker)
+        # Legacy marker-only messages are accepted only while an attempt is
+        # active; new guards also identify the attempt across page reloads.
+        key = values[index + 1] if index + 1 < len(values) else ""
+        if marker in {ui_ready_marker, ui_loading_marker} and not key:
+            return False
+        if key and key in completed_outcome_keys:
+            return False
+        # A guard can restore a pending attempt after a browser/watcher reload,
+        # or click a button already open before the study queue has a target.
+        if not active_target and key and marker not in {ui_ready_marker, ui_loading_marker}:
+            active_target = True
+            active_outcome_key = key
+        return active_target and (not key or key == active_outcome_key)
+
     duplicates_closed = close_duplicate_prolific_targets(port, websocket_url)
     if duplicates_closed:
         log(f"Closed {duplicates_closed} duplicate Prolific tab(s).")
@@ -1040,16 +1150,19 @@ def watch_browser_tokens(
 
             if (
                 active_target
+                and active_load_deadline is not None
+                and time.monotonic() >= active_load_deadline
+            ):
+                log(f"Page did not become ready within {page_load_timeout_seconds} seconds.")
+                finish_target("unconfirmed", "page_load_timeout")
+
+            if (
+                active_target
                 and active_result_deadline is not None
                 and time.monotonic() >= active_result_deadline
             ):
                 log("No Prolific reservation result appeared within 120 seconds.")
-                complete_diagnostic("click_no_response")
-                active_target = False
-                active_target_deadline = None
-                active_result_deadline = None
-                active_attempt_id = None
-                active_failure_reason = None
+                finish_target("unconfirmed", "click_no_response")
 
             if (
                 active_target
@@ -1060,19 +1173,15 @@ def watch_browser_tokens(
                     f"Browser target timed out after {target_timeout_seconds} seconds; "
                     "advancing to the next queued study."
                 )
-                complete_diagnostic(active_failure_reason or "card_not_found")
-                active_target = False
-                active_target_deadline = None
-                active_result_deadline = None
-                active_attempt_id = None
-                active_failure_reason = None
+                finish_target("unconfirmed", active_failure_reason or "card_not_found")
                 devtools.command(
                     "Runtime.evaluate",
                     {
                         "expression": (
                             "sessionStorage.removeItem('prolificAutoTargetStudyTitle');"
                             "sessionStorage.removeItem('prolificAutoTargetStudyId');"
-                            "sessionStorage.removeItem('prolificAutoTargetStudyDetectedAt')"
+                            "sessionStorage.removeItem('prolificAutoTargetStudyDetectedAt');"
+                            "sessionStorage.removeItem('prolificAutoTakePartPendingAt')"
                         ),
                     },
                 )
@@ -1108,6 +1217,10 @@ def watch_browser_tokens(
                             log(f"Could not begin browser diagnostic: {exc}")
                     active_failure_reason = None
                     active_result_deadline = None
+                    active_phase = "search"
+                    search_remaining = float(target_timeout_seconds)
+                    result_remaining = 120.0
+                    active_outcome_key = f"{target_id}:{time.time_ns()}"
                     devtools.command(
                         "Runtime.evaluate",
                         {
@@ -1121,14 +1234,18 @@ def watch_browser_tokens(
                                 ");sessionStorage.setItem("
                                 "'prolificAutoTargetStudyDetectedAt', "
                                 "String(Date.now())"
-                                ")"
+                                ");sessionStorage.setItem("
+                                "'prolificAutoAttemptKey', "
+                                f"{json.dumps(active_outcome_key)}"
+                                ");sessionStorage.removeItem('prolificAutoTakePartPendingAt');"
+                                "sessionStorage.removeItem('prolificAutoResultRemainingMs');"
+                                f"sessionStorage.setItem('prolificAutoSearchRemainingMs', {json.dumps(str(target_timeout_seconds * 1000))})"
                             ),
                         },
                     )
                     active_target = True
-                    active_target_deadline = (
-                        time.monotonic() + target_timeout_seconds
-                    )
+                    active_target_deadline = None
+                    active_load_deadline = time.monotonic() + page_load_timeout_seconds
                     target_label = target_title or target_id
                     log(f"Queued study detected; opening it in browser: {target_label}")
                     record_diagnostic("target_queued", "card_search")
@@ -1154,6 +1271,15 @@ def watch_browser_tokens(
             method = message.get("method")
             params = message.get("params") or {}
 
+            if method == "Page.frameNavigated":
+                frame = params.get("frame") or {}
+                if not frame.get("parentId"):
+                    main_frame_id = str(frame.get("id", ""))
+                    pause_for_loading()
+            if method == "Page.frameStartedLoading":
+                if main_frame_id is None or str(params.get("frameId", "")) == main_frame_id:
+                    pause_for_loading()
+
             if method == "Page.loadEventFired":
                 install_take_part_guard(devtools, config_path)
 
@@ -1166,28 +1292,22 @@ def watch_browser_tokens(
                     for argument in params.get("args", [])
                     if isinstance(argument, dict)
                 ]
-                if click_guard_marker in values:
+                if ui_loading_marker in values and matches_attempt(values, ui_loading_marker):
+                    pause_for_loading()
+                if ui_ready_marker in values and matches_attempt(values, ui_ready_marker):
+                    resume_after_loading(values)
+                if click_guard_marker in values and matches_attempt(values, click_guard_marker):
                     log("Take part button clicked; waiting for Prolific to confirm the reservation.")
                     active_target_deadline = None
+                    active_load_deadline = None
+                    active_phase = "result"
+                    result_remaining = 120.0
                     active_result_deadline = time.monotonic() + 120
                     record_diagnostic("button_clicked", "reservation")
-                if reserved_marker in values:
-                    complete_diagnostic("reserved")
-                    handle_reservation_result(config_path, reserved=True)
-                    active_target = False
-                    active_target_deadline = None
-                    active_result_deadline = None
-                    active_attempt_id = None
-                    active_failure_reason = None
-                    pending_studies.clear()
-                if full_marker in values:
-                    complete_diagnostic("study_full")
-                    handle_reservation_result(config_path, reserved=False)
-                    active_target = False
-                    active_target_deadline = None
-                    active_result_deadline = None
-                    active_attempt_id = None
-                    active_failure_reason = None
+                if reserved_marker in values and matches_attempt(values, reserved_marker):
+                    finish_target("reserved")
+                if full_marker in values and matches_attempt(values, full_marker):
+                    finish_target("study_full")
                 if high_demand_marker in values:
                     log("High demand detected; automatically retrying the Take part button.")
                     record_diagnostic("high_demand", "retry")
@@ -1227,25 +1347,15 @@ def watch_browser_tokens(
                         "text_not_recognized",
                     }:
                         active_failure_reason = diagnostic_status
-                if no_response_marker in values:
+                if no_response_marker in values and matches_attempt(values, no_response_marker):
                     log("No Prolific reservation result appeared within 120 seconds.")
-                    complete_diagnostic("click_no_response")
-                    active_target = False
-                    active_target_deadline = None
-                    active_result_deadline = None
-                    active_attempt_id = None
-                    active_failure_reason = None
-                if target_expired_marker in values:
+                    finish_target("unconfirmed", "click_no_response")
+                if target_expired_marker in values and matches_attempt(values, target_expired_marker):
                     log(
                         f"Target study expired after {target_timeout_seconds} seconds; "
                         "it is no longer available."
                     )
-                    complete_diagnostic(active_failure_reason or "card_not_found")
-                    active_target = False
-                    active_target_deadline = None
-                    active_result_deadline = None
-                    active_attempt_id = None
-                    active_failure_reason = None
+                    finish_target("unconfirmed", active_failure_reason or "card_not_found")
 
             if "id" in message:
                 command_id = int(message["id"])
@@ -1410,6 +1520,23 @@ def handle_reservation_result(config_path: Path | None, reserved: bool) -> None:
         log(f"Telegram reservation result message failed: {exc}")
 
 
+def handle_unconfirmed_reservation(config_path: Path | None, page_loading: bool = False) -> None:
+    if config_path is None:
+        return
+    try:
+        config = load_config(config_path)
+        send_telegram(
+            config,
+            ("<b>The Prolific page did not finish loading.</b>\n"
+             "The reservation status is unknown. Please check the browser."
+             if page_loading else
+             "<b>Could not confirm the reservation.</b>\n"
+             "No clear result appeared while the page was ready."),
+        )
+    except MonitorError as exc:
+        log(f"Telegram unconfirmed reservation message failed: {exc}")
+
+
 def handle_manual_only_study(config_path: Path | None, console_values: list[str]) -> None:
     if config_path is None:
         return
@@ -1473,7 +1600,7 @@ def install_take_part_guard(
         if not isinstance(browser_config, dict) or not browser_config.get("auto_take_part", True):
             return
         target_study_timeout_seconds = int(
-            browser_config.get("target_study_timeout_seconds", 60)
+            browser_config.get("target_study_timeout_seconds", 20)
         )
         devtools.command(
             "Runtime.evaluate",
@@ -1496,6 +1623,7 @@ def build_persistent_take_part_script(
     script = """
 (() => {
   if (window.__prolificTakePartGuardActive) return "already-active";
+  if (!document.documentElement) return "not-ready";
   window.__prolificTakePartGuardActive = true;
 
   const marker = "PROLIFIC_AUTO_TAKE_PART_CLICKED";
@@ -1508,6 +1636,8 @@ def build_persistent_take_part_script(
   const targetExpiredMarker = "PROLIFIC_TARGET_STUDY_EXPIRED";
   const diagnosticMarker = "PROLIFIC_TAKE_PART_DIAGNOSTIC";
   const noResponseMarker = "PROLIFIC_TAKE_PART_NO_RESPONSE";
+  const uiReadyMarker = "PROLIFIC_STUDY_UI_READY";
+  const uiLoadingMarker = "PROLIFIC_STUDY_UI_LOADING";
   const targetText = "take part in this study";
   const targetStudyMaxAgeMs = __TARGET_STUDY_MAX_AGE_MS__;
   const manualOnlyEnabled = __MANUAL_ONLY_ENABLED__;
@@ -1535,9 +1665,26 @@ def build_persistent_take_part_script(
       else sessionStorage.removeItem(pendingKey);
     } catch (_) {}
   };
+  let attemptKey = "";
+  try { attemptKey = sessionStorage.getItem("prolificAutoAttemptKey") || ""; } catch (_) {}
   let pendingAt = readPendingAt();
-  let waitingForResult = pendingAt > 0 && Date.now() - pendingAt < 120000;
+  let waitingForResult = pendingAt > 0;
+  const readBudget = (key, fallback) => {
+    try {
+      const stored = sessionStorage.getItem(key);
+      const value = stored === null ? fallback : Number(stored);
+      return Number.isFinite(value) ? Math.max(0, value) : fallback;
+    } catch (_) { return fallback; }
+  };
+  let searchRemainingMs = readBudget("prolificAutoSearchRemainingMs", targetStudyMaxAgeMs);
+  let resultRemainingMs = readBudget("prolificAutoResultRemainingMs", 120000);
+  let uiWasReady = null;
+  let lastBudgetAt = Date.now();
   let reportedResult = false;
+  try {
+    reportedResult = Boolean(attemptKey) &&
+      sessionStorage.getItem("prolificAutoReportedOutcomeKey") === attemptKey;
+  } catch (_) {}
   let retryMode = false;
   let nextRetryAt = 0;
   let lastHighDemandNoticeAt = 0;
@@ -1573,16 +1720,13 @@ def build_persistent_take_part_script(
   const expireTargetStudyIfNeeded = () => {
     if (targetStudyExpired) return true;
     if (!targetStudyTitle && !targetStudyId) return false;
-    if (
-      targetStudyDetectedAt &&
-      Date.now() - targetStudyDetectedAt < targetStudyMaxAgeMs
-    ) return false;
+    if (searchRemainingMs > 0) return false;
     const expiredStudyId = targetStudyId;
     const expiredStudyTitle = targetStudyTitleRaw;
     clearTargetStudy();
     targetStudyExpired = true;
     targetStudySelected = false;
-    console.log(targetExpiredMarker, expiredStudyId, expiredStudyTitle);
+    reportOutcome(targetExpiredMarker, expiredStudyId, expiredStudyTitle);
     return true;
   };
   const reservedTexts = [
@@ -1597,9 +1741,12 @@ def build_persistent_take_part_script(
   const fullTexts = [
     "study is full",
     "study is currently full",
+    "study is already full",
     "this study is full",
     "no places available",
     "no places are available",
+    "no more places available",
+    "no available places",
     "all places have been taken",
     "study has filled up"
   ];
@@ -1905,8 +2052,36 @@ def build_persistent_take_part_script(
     }
     return true;
   };
+  const reportOutcome = (marker, ...details) => {
+    if (reportedResult) return false;
+    reportedResult = true;
+    waitingForResult = false;
+    retryMode = false;
+    writePendingAt(0);
+    clearTargetStudy();
+    try {
+      if (attemptKey) sessionStorage.setItem("prolificAutoReportedOutcomeKey", attemptKey);
+    } catch (_) {}
+    console.log(marker, attemptKey, ...details);
+    return true;
+  };
   const detectReservationResult = () => {
-    if (!waitingForResult || reportedResult || !document.body) return false;
+    if (reportedResult || !document.body) return false;
+    // Before a click, require a matching detail heading or study URL. A full
+    // message on the study list or another study must not finish this attempt.
+    const matchingDetail = Boolean(targetStudyId || targetStudyTitle) && (
+      (targetStudyId && normalize(location.href).includes(targetStudyId)) ||
+      (targetStudyTitle && roots().some((root) =>
+        Array.from(root.querySelectorAll("h1, [role='heading'][aria-level='1']"))
+          .some((heading) => {
+            const rect = heading.getBoundingClientRect();
+            return rect.width && rect.height && titleSimilarity(
+              heading.innerText || heading.textContent || ""
+            ) >= 0.75;
+          })
+      ))
+    );
+    if (!waitingForResult && !matchingDetail) return false;
     const pageText = normalize(document.body.innerText || document.body.textContent || "");
     const statusTexts = resultTexts();
     const isReserved =
@@ -1916,20 +2091,12 @@ def build_persistent_take_part_script(
         pageText.includes("cancel participation")
       );
     if (isReserved) {
-      reportedResult = true;
-      waitingForResult = false;
-      writePendingAt(0);
-      console.log(reservedMarker);
-      return true;
+      return reportOutcome(reservedMarker);
     }
     if (fullTexts.some((text) => statusTexts.some((status) => status.includes(text)))) {
-      reportedResult = true;
-      waitingForResult = false;
-      writePendingAt(0);
-      console.log(fullMarker);
-      return true;
+      return reportOutcome(fullMarker);
     }
-    if (highDemandTexts.some((text) => statusTexts.some((status) => status.includes(text)))) {
+    if (waitingForResult && highDemandTexts.some((text) => statusTexts.some((status) => status.includes(text)))) {
       waitingForResult = false;
       retryMode = true;
       if (Date.now() - lastHighDemandNoticeAt >= 5000) {
@@ -1938,14 +2105,13 @@ def build_persistent_take_part_script(
       }
       return true;
     }
-    if (pendingAt && Date.now() - pendingAt >= 120000) {
-      waitingForResult = false;
-      writePendingAt(0);
-      console.log(noResponseMarker);
+    if (pendingAt && resultRemainingMs <= 0) {
+      return reportOutcome(noResponseMarker);
     }
     return false;
   };
   const clickCandidate = () => {
+    if (reportedResult || waitingForResult) return false;
     if (!selectTargetStudy()) return false;
     if (isManualOnlyStudy()) return false;
     const snapshot = takePartSnapshot();
@@ -1974,6 +2140,12 @@ def build_persistent_take_part_script(
         clickedControls.add(control);
         control.scrollIntoView({block: "center", inline: "center"});
         pendingAt = Date.now();
+        resultRemainingMs = 120000;
+        try { sessionStorage.setItem("prolificAutoResultRemainingMs", "120000"); } catch (_) {}
+        if (!attemptKey) {
+          attemptKey = `page:${pendingAt}`;
+          try { sessionStorage.setItem("prolificAutoAttemptKey", attemptKey); } catch (_) {}
+        }
         writePendingAt(pendingAt);
         waitingForResult = true;
         reportedResult = false;
@@ -1981,24 +2153,76 @@ def build_persistent_take_part_script(
         nextRetryAt = Date.now() + 500;
         control.click();
         clearTargetStudy();
-        console.log(marker);
+        console.log(marker, attemptKey);
         return true;
       }
     }
     return false;
   };
 
-  if (clickCandidate()) return "clicked";
-  const observer = new MutationObserver(() => {
-    detectReservationResult();
-    if (!waitingForResult) clickCandidate();
-  });
+  const studyUiReady = () => {
+    if (!document.body || document.readyState === "loading") return false;
+    const pageText = normalize(document.body.innerText || document.body.textContent || "");
+    if (!pageText) return false;
+    // A loaded HTML shell, navigation bar, or empty refresh screen is not the
+    // study UI. Wait for study content or an explicit empty-list/result state.
+    if (pageHeadingMatchesTarget()) return true;
+    if (visibleTakePartControl()) return true;
+    if (["waiting for studies", "no studies available", "no studies at the moment"]
+        .some((text) => pageText.includes(text))) return true;
+    if ((pendingAt || targetStudyId || targetStudyTitle) && resultTexts().some((text) =>
+      [...reservedTexts, ...fullTexts, ...highDemandTexts].some((phrase) => text.includes(phrase))
+    )) return true;
+    for (const root of roots()) {
+      for (const element of root.querySelectorAll("button, a, [role='button'], [tabindex='0']")) {
+        const rect = element.getBoundingClientRect();
+        if (!rect.width || !rect.height) continue;
+        const label = element.innerText || element.textContent || "";
+        if ((targetStudyTitle && titleSimilarity(label) >= 0.75) ||
+            (targetStudyId && identityValues(element).some((value) => value.includes(targetStudyId)))) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  const tick = () => {
+    try {
+      if (attemptKey && sessionStorage.getItem("prolificAutoReportedOutcomeKey") === attemptKey) {
+        reportedResult = true;
+      }
+    } catch (_) {}
+    if (reportedResult) return false;
+    const now = Date.now();
+    if (!studyUiReady()) {
+      if (uiWasReady !== false) console.log(uiLoadingMarker, attemptKey);
+      uiWasReady = false;
+      lastBudgetAt = now;
+      return false;
+    }
+    if (uiWasReady !== true) {
+      lastBudgetAt = now;
+      console.log(uiReadyMarker, attemptKey, (pendingAt ? "result" : "search"),
+                  searchRemainingMs, resultRemainingMs);
+    }
+    uiWasReady = true;
+    const elapsed = Math.max(0, now - lastBudgetAt);
+    lastBudgetAt = now;
+    if (pendingAt) resultRemainingMs = Math.max(0, resultRemainingMs - elapsed);
+    else if (targetStudyId || targetStudyTitle) searchRemainingMs = Math.max(0, searchRemainingMs - elapsed);
+    try {
+      sessionStorage.setItem("prolificAutoSearchRemainingMs", String(searchRemainingMs));
+      sessionStorage.setItem("prolificAutoResultRemainingMs", String(resultRemainingMs));
+    } catch (_) {}
+    if (detectReservationResult()) return false;
+    return clickCandidate();
+  };
+  // Register both watchers before the first click, including when the button
+  // is already available at installation time.
+  const observer = new MutationObserver(tick);
   observer.observe(document.documentElement, {subtree: true, childList: true, characterData: true});
-  setInterval(() => {
-    detectReservationResult();
-    if (!waitingForResult) clickCandidate();
-  }, 100);
-  return "watching";
+  setInterval(tick, 100);
+  return tick() ? "clicked" : "watching";
 })()
 """.strip()
     return (

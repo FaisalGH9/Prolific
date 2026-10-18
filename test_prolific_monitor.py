@@ -1,4 +1,6 @@
 import json
+import shutil
+import subprocess
 import queue
 import socket
 import sqlite3
@@ -35,6 +37,16 @@ class RewardFormattingTests(unittest.TestCase):
 
 
 class BrowserGuardTests(unittest.TestCase):
+    def test_guard_outcomes_in_javascript_runtime(self) -> None:
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for browser guard regression tests")
+        result = subprocess.run(
+            [node, str(Path(__file__).with_name("test_browser_guard.cjs"))],
+            input=monitor.build_persistent_take_part_script(),
+            text=True, capture_output=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_target_study_expires_without_disabling_manual_only_rule(self) -> None:
         script = monitor.build_persistent_take_part_script()
 
@@ -147,6 +159,163 @@ class DiagnosticStoreTests(unittest.TestCase):
 
 
 class BrowserStudyQueueTests(unittest.TestCase):
+    def run_outcome_events(self, events, studies=None, clock=None):
+        stop = threading.Event()
+        current_time = [100.0]
+        detected = queue.Queue()
+        if studies is None:
+            studies = [{"id": "study-1", "title": "First study"}]
+        if studies:
+            detected.put(studies)
+
+        class DevTools:
+            def __init__(self, _url):
+                self.events = iter(events)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def command(self, *_args):
+                return 1
+
+            def recv_json(self):
+                try:
+                    values = next(self.events)
+                except StopIteration:
+                    stop.set()
+                    return {}
+                if isinstance(values, dict):
+                    current_time[0] = values.get("at", current_time[0])
+                    if "method" in values:
+                        return values
+                    values = values.get("values", [])
+                return {"method": "Runtime.consoleAPICalled",
+                        "params": {"args": [{"value": value} for value in values]}}
+
+        with (
+            patch.object(monitor, "wait_for_devtools"),
+            patch.object(monitor, "get_or_create_page_target", return_value="ws://fake"),
+            patch.object(monitor, "close_duplicate_prolific_targets", return_value=0),
+            patch.object(monitor, "prolific_target_changed", return_value=False),
+            patch.object(monitor, "load_config", return_value={"diagnostics": {"enabled": False}}),
+            patch.object(monitor, "DevToolsWebSocket", DevTools),
+            patch.object(monitor.time, "time_ns", side_effect=range(1, 10)),
+            patch.object(monitor.time, "monotonic", side_effect=(clock if clock is not None else lambda: current_time[0])),
+            patch.object(monitor, "handle_reservation_result") as result,
+            patch.object(monitor, "handle_unconfirmed_reservation") as unconfirmed,
+            patch.object(monitor, "log"),
+        ):
+            monitor.watch_browser_tokens(config_path=Path("config.json"),
+                                         stop_event=stop, study_queue=detected)
+        return result.call_args_list, unconfirmed.call_args_list
+
+    def test_slow_refresh_waits_for_ready_ui_before_search_timeout(self):
+        result, unconfirmed = self.run_outcome_events([
+            {"at": 121},
+            {"at": 141, "values": ["PROLIFIC_STUDY_UI_READY", "study-1:1", "search", 20000, 120000]},
+            {"at": 145, "values": ["PROLIFIC_STUDY_FULL", "study-1:1"]},
+        ])
+        self.assertEqual(unconfirmed, [])
+        self.assertEqual(result, [call(Path("config.json"), reserved=False)])
+
+    def test_unkeyed_ready_event_cannot_start_a_queued_study_timer(self):
+        result, unconfirmed = self.run_outcome_events([
+            ["PROLIFIC_STUDY_UI_READY", ""],
+            {"at": 145},
+            ["PROLIFIC_STUDY_UI_READY", "study-1:1", "search", 20000, 120000],
+            ["PROLIFIC_STUDY_FULL", "study-1:1"],
+        ])
+        self.assertEqual(unconfirmed, [])
+        self.assertEqual(result, [call(Path("config.json"), reserved=False)])
+
+    def test_hung_loading_uses_loading_specific_notice_once(self):
+        result, unconfirmed = self.run_outcome_events([
+            {"at": 221},
+            ["PROLIFIC_STUDY_FULL", "study-1:1"],
+            ["PROLIFIC_STUDY_UI_READY", "study-1:1"],
+        ])
+        self.assertEqual(result, [])
+        self.assertEqual(unconfirmed, [call(Path("config.json"), page_loading=True)])
+
+    def test_loading_notice_does_not_claim_the_study_disappeared(self):
+        with (patch.object(monitor, "load_config", return_value={}),
+              patch.object(monitor, "send_telegram") as send):
+            monitor.handle_unconfirmed_reservation(Path("config.json"), page_loading=True)
+        message = send.call_args.args[1]
+        self.assertIn("page did not finish loading", message)
+        self.assertNotIn("disappeared", message)
+
+    def test_navigation_pauses_search_budget_until_ui_returns(self):
+        result, unconfirmed = self.run_outcome_events([
+            {"at": 110, "values": ["PROLIFIC_STUDY_UI_READY", "study-1:1", "search", 20000, 120000]},
+            {"at": 115, "method": "Page.frameNavigated", "params": {"frame": {"id": "main"}}},
+            {"at": 156, "values": ["PROLIFIC_STUDY_UI_READY", "study-1:1", "search", 15000, 120000]},
+            {"at": 160, "values": ["PROLIFIC_SEAT_RESERVED", "study-1:1"]},
+        ])
+        self.assertEqual(unconfirmed, [])
+        self.assertEqual(result, [call(Path("config.json"), reserved=True)])
+
+    def test_navigation_pauses_result_budget(self):
+        result, unconfirmed = self.run_outcome_events([
+            {"at": 110, "values": ["PROLIFIC_AUTO_TAKE_PART_CLICKED", "study-1:1"]},
+            {"at": 170, "method": "Page.frameNavigated", "params": {"frame": {"id": "main"}}},
+            {"at": 250, "values": ["PROLIFIC_STUDY_UI_READY", "study-1:1", "result", 20000, 60000]},
+            {"at": 251, "values": ["PROLIFIC_SEAT_RESERVED", "study-1:1"]},
+        ])
+        self.assertEqual(unconfirmed, [])
+        self.assertEqual(result, [call(Path("config.json"), reserved=True)])
+
+    def test_late_and_duplicate_outcomes_do_not_finish_next_study(self):
+        result, unconfirmed = self.run_outcome_events([
+            ["PROLIFIC_STUDY_FULL", "study-1:1"],
+            ["PROLIFIC_STUDY_FULL", "study-1:1"],
+            ["PROLIFIC_SEAT_RESERVED", "study-2:2"],
+            ["PROLIFIC_SEAT_RESERVED", "study-2:2"],
+        ], studies=[{"id": "study-1", "title": "First"},
+                    {"id": "study-2", "title": "Second"}])
+        self.assertEqual(result, [call(Path("config.json"), reserved=False),
+                                  call(Path("config.json"), reserved=True)])
+        self.assertEqual(unconfirmed, [])
+
+    def test_expiry_and_no_response_each_send_one_uncertain_result(self):
+        for marker in ("PROLIFIC_TARGET_STUDY_EXPIRED", "PROLIFIC_TAKE_PART_NO_RESPONSE"):
+            with self.subTest(marker=marker):
+                result, unconfirmed = self.run_outcome_events([
+                    [marker, "study-1:1"], [marker, "study-1:1"],
+                    ["PROLIFIC_STUDY_FULL", "study-1:1"],
+                ])
+                self.assertEqual(result, [])
+                self.assertEqual(unconfirmed, [call(Path("config.json"))])
+
+    def test_python_result_deadline_and_browser_timeout_do_not_duplicate(self):
+        result, unconfirmed = self.run_outcome_events([
+            ["PROLIFIC_AUTO_TAKE_PART_CLICKED", "study-1:1"],
+            ["PROLIFIC_TAKE_PART_NO_RESPONSE", "study-1:1"],
+        ], clock=[100, 100, 221])
+        self.assertEqual(result, [])
+        self.assertEqual(unconfirmed, [call(Path("config.json"))])
+
+    def test_button_open_at_startup_still_reports_one_result(self):
+        result, unconfirmed = self.run_outcome_events([
+            ["PROLIFIC_AUTO_TAKE_PART_CLICKED", "page:123"],
+            ["PROLIFIC_STUDY_FULL", "page:123"],
+            ["PROLIFIC_AUTO_TAKE_PART_CLICKED", "page:123"],
+            ["PROLIFIC_STUDY_FULL", "page:123"],
+        ], studies=[])
+        self.assertEqual(result, [call(Path("config.json"), reserved=False)])
+        self.assertEqual(unconfirmed, [])
+
+    def test_restored_pending_attempt_can_report_without_a_new_click(self):
+        result, unconfirmed = self.run_outcome_events([
+            ["PROLIFIC_STUDY_FULL", "restored:123"],
+            ["PROLIFIC_STUDY_FULL", "restored:123"],
+        ], studies=[])
+        self.assertEqual(result, [call(Path("config.json"), reserved=False)])
+        self.assertEqual(unconfirmed, [])
+
     def test_browser_detected_studies_are_forwarded_to_auto_open_queue(self) -> None:
         studies = [
             {"id": "study-1", "title": "First study"},
@@ -292,6 +461,7 @@ class BrowserStudyQueueTests(unittest.TestCase):
                 return_value=diagnostic_store,
             ),
             patch.object(monitor, "DevToolsWebSocket", FakeDevTools),
+            patch.object(monitor, "load_config", return_value={}),
             patch.object(monitor, "handle_reservation_result") as reservation_result,
         ):
             monitor.watch_browser_tokens(
@@ -306,9 +476,11 @@ class BrowserStudyQueueTests(unittest.TestCase):
             for method, params in FakeDevTools.instance.commands
             if method == "Runtime.evaluate"
         ]
-        self.assertEqual(len(runtime_expressions), 2)
-        self.assertIn("First study", runtime_expressions[0])
-        self.assertIn("Second study", runtime_expressions[1])
+        target_expressions = [expression for expression in runtime_expressions
+                              if "'prolificAutoTargetStudyTitle', " in expression]
+        self.assertEqual(len(target_expressions), 2)
+        self.assertIn("First study", target_expressions[0])
+        self.assertIn("Second study", target_expressions[1])
         self.assertEqual(
             reservation_result.call_args_list,
             [
@@ -361,6 +533,10 @@ class BrowserStudyQueueTests(unittest.TestCase):
 
             def recv_json(self) -> dict[str, object]:
                 self.receive_count += 1
+                if self.receive_count == 1:
+                    return {"method": "Runtime.consoleAPICalled", "params": {
+                        "args": [{"value": "PROLIFIC_STUDY_UI_READY"}, {"value": "study-1:1"}]
+                    }}
                 if self.receive_count >= 2:
                     stop_event.set()
                 raise socket.timeout
@@ -383,7 +559,9 @@ class BrowserStudyQueueTests(unittest.TestCase):
                 return_value=False,
             ),
             patch.object(monitor, "install_take_part_guard"),
+            patch.object(monitor, "handle_unconfirmed_reservation") as unconfirmed,
             patch.object(monitor, "DevToolsWebSocket", TimeoutDevTools),
+            patch.object(monitor.time, "time_ns", return_value=1),
             patch.object(
                 monitor,
                 "load_config",
@@ -394,7 +572,7 @@ class BrowserStudyQueueTests(unittest.TestCase):
             patch.object(
                 monitor.time,
                 "monotonic",
-                side_effect=[100.0, 121.0],
+                side_effect=[100.0, 100.0, 121.0],
             ),
             patch.object(monitor, "log") as monitor_log,
         ):
@@ -405,6 +583,7 @@ class BrowserStudyQueueTests(unittest.TestCase):
             )
 
         self.assertIsNotNone(TimeoutDevTools.instance)
+        unconfirmed.assert_called_once_with(Path("prolific-monitor.json"))
         runtime_expressions = [
             str((params or {}).get("expression", ""))
             for method, params in TimeoutDevTools.instance.commands

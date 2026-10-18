@@ -5,6 +5,7 @@
 
 # Local browser session and authentication data
 .browser-profile/
+.browser-profile-chrome/
 
 # Runtime state
 state/

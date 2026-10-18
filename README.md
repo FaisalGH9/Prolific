@@ -4,12 +4,19 @@ A lightweight Python monitor that watches the Prolific participant studies feed,
 sends Telegram alerts, and assists with opening and reserving newly available
 studies through a locally controlled browser.
 
-## Current version — 4 September 2026
+## Current version — 18 October 2026
 
 This version includes:
 
 - Polling of Prolific's participant studies endpoint with duplicate suppression.
 - Telegram notifications for new studies and reservation results.
+- Google Chrome is preferred by default. The desktop launcher explicitly uses
+  Chrome with port `9223` and the separate `.browser-profile-chrome` profile.
+- Reservation monitoring starts before the first button click, including when
+  the button is already visible. Full studies can also be detected before a
+  click when the matching study details are visible.
+- A reservation attempt reports one terminal result, with duplicate and stale
+  browser events suppressed across page reloads.
 - Correct reward formatting from Prolific's minor currency units, for example
   `398` is displayed as `£3.98`.
 - Automatic Prolific bearer-token refresh from browser network activity.
@@ -18,9 +25,11 @@ This version includes:
   a fallback.
 - Interactive-card targeting and retries until the real **Take part** button
   appears.
-- A stale study target expires after 20 seconds when its card is no longer
-  available. Once cleared, the browser guard stops producing repeated
-  **Target study card not found** messages and continues watching normally.
+- A stale study target expires after 20 seconds of ready-page search time.
+  Search and result timers pause while the page loads. A separate page-loading
+  limit defaults to 120 seconds (`browser.page_load_timeout_seconds`).
+- Unclear reservation results and page-loading timeouts produce distinct
+  Telegram notices rather than being reported as full studies.
 - Automatic retries when Prolific reports that a study is in high demand.
 - Detection and Telegram reporting of successful reservations and full studies.
 - Structured SQLite diagnostics for each browser reservation attempt, including
@@ -41,6 +50,8 @@ This version includes:
   Telegram integration.
 - `prolific-monitor.json` — polling and browser-request configuration.
 - `test_prolific_monitor.py` — reward-formatting and browser-guard tests.
+- `test_browser_guard.cjs` — isolated JavaScript scenarios used by the Python
+  tests to verify browser behavior without opening a browser or sending alerts.
 - `.env.example` — required environment-variable names without secret values.
 
 ## Configuration
@@ -56,11 +67,12 @@ TELEGRAM_CHAT_ID=
 Never commit `.env`, Telegram bot tokens, bearer tokens, the browser profile, or
 runtime state. These paths are excluded by `.gitignore`.
 
-Browser diagnostics are enabled by default:
+Browser diagnostics are disabled in the supplied configuration. Set `enabled`
+to `true` to record reservation diagnostics:
 
 ```json
 "diagnostics": {
-  "enabled": true,
+  "enabled": false,
   "retention_hours": 72
 }
 ```
@@ -87,6 +99,10 @@ Run the monitor with automatic browser token refresh:
 py .\prolific_monitor.py run-with-browser
 ```
 
+Alternatively, use **Start Prolific Monitor** on the desktop. Sign in to Prolific
+in the separate Chrome profile on its first launch. Existing Brave profile data
+is preserved, and the monitor uses a separate port to avoid attaching to it.
+
 Show reservation diagnostics from the last three days:
 
 ```powershell
@@ -99,7 +115,7 @@ Use a shorter reporting window when needed:
 py .\prolific_monitor.py diagnostics --hours 24
 ```
 
-Run the tests:
+Run the tests with Python and Node.js installed:
 
 ```powershell
 py -m unittest -v

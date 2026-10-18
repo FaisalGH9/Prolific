@@ -1,10 +1,14 @@
 @echo off
 setlocal
 
-title Prolific Monitor - Awake for 15 Hours
+title Prolific Monitor - Chrome - Awake for 15 Hours
 
 set "PROJECT_DIR=%~dp0"
 set "MONITOR_SCRIPT=%PROJECT_DIR%prolific_monitor.py"
+set "MONITOR_BROWSER=%ProgramFiles%\Google\Chrome\Application\chrome.exe"
+if not exist "%MONITOR_BROWSER%" set "MONITOR_BROWSER=%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"
+set "MONITOR_BROWSER_PORT=9223"
+set "MONITOR_BROWSER_PROFILE=%PROJECT_DIR%.browser-profile-chrome"
 set "AWAKE_SETUP_SCRIPT=%PROJECT_DIR%Set PowerToys Awake 15 Hours.ps1"
 set "AWAKE_EXE=%LOCALAPPDATA%\PowerToys\PowerToys.Awake.exe"
 
@@ -13,6 +17,12 @@ if not exist "%AWAKE_EXE%" set "AWAKE_EXE=%ProgramFiles%\PowerToys\PowerToys.Awa
 if not exist "%MONITOR_SCRIPT%" (
     echo ERROR: prolific_monitor.py was not found in:
     echo %PROJECT_DIR%
+    pause
+    exit /b 1
+)
+
+if not exist "%MONITOR_BROWSER%" (
+    echo ERROR: Google Chrome was not found. Install Chrome before starting the monitor.
     pause
     exit /b 1
 )
@@ -67,9 +77,9 @@ powershell.exe -NoProfile -Command "$existing = Get-CimInstance Win32_Process -E
 if errorlevel 10 goto monitor_already_running
 
 cd /d "%PROJECT_DIR%"
-echo Starting the Prolific monitor...
+echo Starting the Prolific monitor with Google Chrome...
 echo.
-"%PYTHON_LAUNCHER%" "%MONITOR_SCRIPT%" run-with-browser
+"%PYTHON_LAUNCHER%" "%MONITOR_SCRIPT%" run-with-browser --browser-path "%MONITOR_BROWSER%" --port %MONITOR_BROWSER_PORT% --profile-dir "%MONITOR_BROWSER_PROFILE%"
 set "MONITOR_EXIT_CODE=%ERRORLEVEL%"
 
 echo.
@@ -95,6 +105,9 @@ echo Awake: %AWAKE_EXE%
 echo Awake setup: %AWAKE_SETUP_SCRIPT%
 echo Python: %PYTHON_LAUNCHER%
 echo Monitor: %MONITOR_SCRIPT%
+echo Browser: %MONITOR_BROWSER%
+echo Browser port: %MONITOR_BROWSER_PORT%
+echo Browser profile: %MONITOR_BROWSER_PROFILE%
 powershell.exe -NoProfile -Command "$existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^python(w)?\.exe$' -and $_.CommandLine -match 'prolific_monitor\.py\x22?\s+run-with-browser' }; if ($existing) { exit 10 }"
 if errorlevel 10 goto check_monitor_found
 echo Duplicate-monitor check passed: no running monitor was found.
